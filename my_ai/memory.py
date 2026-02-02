@@ -62,7 +62,7 @@ class VectorStore:
         """Add a normalized vector to the store."""
         # Normalize embedding to unit length and ensure float32
         emb_norm = embedding.astype(np.float32) / np.linalg.norm(embedding)
-        emb_norm = emb_norm.reshape(1, -1)  # Shape: (1, D)
+        emb_norm = emb_norm.reshape(1, -1).astype(np.float32)  # Shape: (1, D) and ensure float32
         
         # Check if id already exists
         if id in self.id_to_index:
@@ -71,8 +71,8 @@ class VectorStore:
             self.matrix[idx] = emb_norm
             self.metadata[idx] = {**metadata, "text": text}
         else:
-            # Append new entry
-            self.matrix = np.vstack([self.matrix, emb_norm])
+            # Append new entry - ensure dtype is preserved
+            self.matrix = np.vstack([self.matrix, emb_norm]).astype(np.float32)
             self.ids.append(id)
             self.metadata.append({**metadata, "text": text})
             self.id_to_index[id] = len(self.ids) - 1
