@@ -39,19 +39,67 @@ def generate_response(query: str, context: str) -> str:
         else:
             return f"[offline-test] No context for: {query[:50]}"
 
-    system_prompt = """You are a helpful assistant with memory of past conversations."""
+    system_prompt = """
+You are a helpful assistant with memory of past conversations.
+
+When answering about the user (their pets, preferences, biography, etc.):
+- Treat the section 'Relevant context about the user' as the ONLY source of truth.
+- Do NOT invent or speculate about any user-specific details (e.g. personality traits, habits, activities)
+  that are not explicitly stated in that context.
+- If the user asks for a detail that is not present in the context, say you don't know or that it
+  has not been mentioned yet.
+
+You may still use general world knowledge for non-user-specific questions.
+""".strip()
     
     if context:
         system_prompt += f"\n\nRelevant context about the user:\n{context}"
     
     try:
+        backend = os.getenv("AI_BACKEND", "openai").lower()
+
+        # Allow model and temperature to be configured via environment while keeping
+        # sensible defaults for tests and local usage.
+        if backend == "ollama":
+            # Priority: explicit OLLAMA_MODEL, then AI_MODEL, then a sensible local default.
+            model = os.getenv("OLLAMA_MODEL") or os.getenv("AI_MODEL") or "memory-bot:latest"
+        else:
+            model = os.getenv("AI_MODEL", "gpt-3.5-turbo")
+
+        try:
+            temperature = float(os.getenv("AI_TEMPERATURE", "0.2"))
+        except ValueError:
+            temperature = 0.2
+
+        if backend == "ollama":
+            import requests
+
+            base_url = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+            url = f"{base_url}/api/chat"
+
+            payload = {
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query},
+                ],
+                "stream": False,
+            }
+
+            resp = requests.post(url, json=payload, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            # Ollama's /api/chat returns a single message object when stream=False.
+            return data.get("message", {}).get("content", "")
+
+        # Default: OpenAI Chat Completions backend.
         response = get_client().chat.completions.create(
-            model="gpt-3.5-turbo",  # or "gpt-3.5-turbo" if you don't have GPT-4 access
+            model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": query}
             ],
-            temperature=0.7,
+            temperature=temperature,
             max_tokens=500
         )
         return response.choices[0].message.content
