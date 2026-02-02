@@ -6,33 +6,116 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 import re
 import hashlib
+from functools import lru_cache
+
+from .embedding_cache import EmbeddingCache
+
+# Precompiled regex patterns for performance
+_EXPLICIT_PATTERNS = [
+    (re.compile(r"my (\w+) is (.+)", re.IGNORECASE), None),
+    (re.compile(r"remember that (.+)", re.IGNORECASE), "fact"),
+    (re.compile(r"remember (?!that\b)(.+)", re.IGNORECASE), "fact"),
+    (re.compile(r"(?:don't forget|note that) (.+)", re.IGNORECASE), "fact"),
+    (re.compile(r"i have (.+)", re.IGNORECASE), "fact"),
+    (re.compile(r"i (?:work at|live in|prefer|hate|love|need) (.+)", re.IGNORECASE), "preference"),
+    (re.compile(r"i'm (?:a|an) (.+)", re.IGNORECASE), "identity"),
+]
+
+# Precompiled patterns for normalization
+_FIELD_VALUE_PATTERN = re.compile(r"^(\w+):\s*(.+)$")
+_MY_X_IS_Y_PATTERN = re.compile(r"my (\w+) is (.+)", re.IGNORECASE)
+_DOGS_PATTERN_1 = re.compile(
+    r"i have two dogs: one named ([^,]+),?\s*and the other(?: is)? named ([^,]+)",
+    re.IGNORECASE,
+)
+_DOGS_PATTERN_2 = re.compile(
+    r"two dogs: one named ([^,]+),?\s*and the other(?: is)? named ([^,]+)",
+    re.IGNORECASE,
+)
+_MULTI_ENTITY_1 = re.compile(
+    r"i have\s+(\w+)\s+(\w+)s\s+named\s+([^,]+),?\s*(?:and|, and)\s*([^,]+)",
+    re.IGNORECASE,
+)
+_MULTI_ENTITY_2 = re.compile(
+    r"(\w+)\s+(\w+)s\s+named\s+([^,]+),?\s*(?:and|, and)\s*([^,]+)",
+    re.IGNORECASE,
+)
+
 
 class VectorStore:
-    """Simple in-memory vector store using numpy (replace with Chroma/Pinecone in prod)"""
+    """Numpy-matrix-backed vector store with vectorized search.
+    
+    This implementation uses a contiguous numpy matrix for fast BLAS-backed
+    dot products and vectorized operations for efficient similarity search.
+    All embeddings are normalized to unit length and stored as float32.
+    """
     def __init__(self, dim: int = 384):  # all-MiniLM-L6-v2 dimension
         self.dim = dim
-        self.vectors: Dict[str, np.ndarray] = {}  # id -> vector
-        self.metadata: Dict[str, dict] = {}       # id -> metadata
+        # Contiguous numpy matrix (N x D) for fast dot products
+        self.matrix = np.empty((0, dim), dtype=np.float32)
+        # Parallel lists/dicts for metadata
+        self.ids: List[str] = []  # Parallel to matrix rows
+        self.metadata: List[dict] = []  # Parallel to matrix rows
+        self.id_to_index: Dict[str, int] = {}  # Fast lookup
         
     def add(self, id: str, text: str, metadata: dict, embedding: np.ndarray):
-        self.vectors[id] = embedding / np.linalg.norm(embedding)  # normalize
-        self.metadata[id] = {**metadata, "text": text}
+        """Add a normalized vector to the store."""
+        # Normalize embedding to unit length and ensure float32
+        emb_norm = embedding.astype(np.float32) / np.linalg.norm(embedding)
+        emb_norm = emb_norm.reshape(1, -1)  # Shape: (1, D)
+        
+        # Check if id already exists
+        if id in self.id_to_index:
+            # Update existing entry
+            idx = self.id_to_index[id]
+            self.matrix[idx] = emb_norm
+            self.metadata[idx] = {**metadata, "text": text}
+        else:
+            # Append new entry
+            self.matrix = np.vstack([self.matrix, emb_norm])
+            self.ids.append(id)
+            self.metadata.append({**metadata, "text": text})
+            self.id_to_index[id] = len(self.ids) - 1
     
     def search(self, query_emb: np.ndarray, user_id: str, top_k: int = 3) -> List[Tuple[str, float]]:
-        """Return top_k matches filtered by user_id"""
-        query_norm = query_emb / np.linalg.norm(query_emb)
-        results = []
+        """Return top_k matches filtered by user_id using vectorized operations."""
+        if self.matrix.shape[0] == 0:
+            return []
         
-        for id, vec in self.vectors.items():
-            meta = self.metadata[id]
-            if meta.get("user_id") != user_id:
-                continue
-            # Cosine similarity
-            score = float(np.dot(query_norm, vec))
-            results.append((id, score))
-            
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
+        # Normalize query to unit length
+        query_norm = query_emb.astype(np.float32) / np.linalg.norm(query_emb)
+        
+        # Vectorized dot product: (N x D) @ (D,) = (N,)
+        scores = self.matrix.dot(query_norm)
+        
+        # Create boolean mask for user_id filtering
+        user_mask = np.array([meta.get("user_id") == user_id 
+                              for meta in self.metadata], dtype=bool)
+        
+        # Apply mask - set non-matching scores to -inf
+        masked_scores = np.where(user_mask, scores, -np.inf)
+        
+        # Find top_k using argpartition for efficiency
+        # (only partially sorts, which is faster than full sort)
+        valid_count = np.sum(user_mask)
+        if valid_count == 0:
+            return []
+        
+        k = min(top_k, valid_count)
+        
+        # Get indices of top k scores
+        if k < valid_count:
+            # Use argpartition for partial sorting (faster)
+            partition_idx = np.argpartition(masked_scores, -k)[-k:]
+            # Final sort of the top k for correct ordering
+            top_indices = partition_idx[np.argsort(masked_scores[partition_idx])][::-1]
+        else:
+            # If we need all valid items, just sort them
+            top_indices = np.argsort(masked_scores)[::-1][:k]
+        
+        # Build result list
+        results = [(self.ids[idx], float(scores[idx])) for idx in top_indices]
+        return results
 
 class HybridMemorySystem:
     def __init__(self, db_path: str | None = None):
@@ -47,7 +130,10 @@ class HybridMemorySystem:
 
         self.db_path = db_path
         self.vector_store = VectorStore()
-        self.embeddings_cache = {}  # Simple embedding cache
+        
+        # Two-tier caching: in-memory LRU + persistent SQLite
+        self.embeddings_cache = {}  # In-memory cache for current session
+        self.persistent_cache = EmbeddingCache()  # Persistent disk cache
         
         # Mock embedding function (replace with real model)
         self.mock_vocabulary = {}
@@ -55,9 +141,14 @@ class HybridMemorySystem:
         self._init_db()
         
     def _init_db(self):
-        """Initialize SQLite tables"""
+        """Initialize SQLite tables with performance optimizations"""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
+        
+        # Performance tuning: WAL mode for better concurrency
+        c.execute('PRAGMA journal_mode = WAL')
+        # Performance tuning: NORMAL synchronous for better throughput
+        c.execute('PRAGMA synchronous = NORMAL')
         
         # Explicit memories
         c.execute('''CREATE TABLE IF NOT EXISTS explicit_memories
@@ -75,6 +166,14 @@ class HybridMemorySystem:
                      (id INTEGER PRIMARY KEY, user_id TEXT, role TEXT, 
                       content TEXT, timestamp TEXT)''')
         
+        # Performance indexes for common queries
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_conversation_user_ts 
+                     ON conversation_turns(user_id, timestamp DESC)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_implicit_user 
+                     ON implicit_memories(user_id)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_explicit_user 
+                     ON explicit_memories(user_id)''')
+        
         conn.commit()
         conn.close()
     
@@ -84,10 +183,13 @@ class HybridMemorySystem:
         By default we use a mock, hash-based embedding so tests and offline runs
         do not depend on a real model. If AI_EMBEDDING_BACKEND="ollama" is set,
         we call an Ollama embedding model instead (e.g. nomic-embed-text).
+        
+        Uses two-tier caching: in-memory dict + persistent SQLite cache.
         """
         backend = os.getenv("AI_EMBEDDING_BACKEND", "mock").lower()
 
         # Fast, deterministic mock for tests and simple local runs.
+        # Mock embeddings are not cached persistently since they're deterministic
         if backend == "mock":
             text_norm = text.lower()
             np.random.seed(int(hashlib.md5(text_norm.encode()).hexdigest(), 16) % (2**32))
@@ -102,9 +204,18 @@ class HybridMemorySystem:
             base_url = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
             url = f"{base_url}/api/embed"
 
+            # Check in-memory cache first (fastest)
             cache_key = (backend, model, text)
             if cache_key in self.embeddings_cache:
                 return self.embeddings_cache[cache_key]
+            
+            # Check persistent cache second
+            cache_model_key = f"{backend}::{model}"
+            cached = self.persistent_cache.get(cache_model_key, text)
+            if cached is not None:
+                # Store in memory cache for next time
+                self.embeddings_cache[cache_key] = cached
+                return cached
 
             try:
                 resp = requests.post(
@@ -134,7 +245,9 @@ class HybridMemorySystem:
                         pad = self.vector_store.dim - vec.shape[0]
                         vec = np.pad(vec, (0, pad))
 
+                # Store in both caches
                 self.embeddings_cache[cache_key] = vec
+                self.persistent_cache.set(cache_model_key, text, vec)
                 return vec
             except Exception:
                 # Fall back to mock embedding if Ollama is unavailable or misconfigured.
@@ -163,26 +276,14 @@ class HybridMemorySystem:
             clause = match.group(1)
             # If a generic wrapper like "remember that ..." contains a more
             # structured "my X is Y" pattern, normalize that too.
-            sub = re.match(r"my (\w+) is (.+)", clause, re.IGNORECASE)
+            sub = _MY_X_IS_Y_PATTERN.match(clause)
             if sub:
                 return [f"{sub.group(1)}: {sub.group(2)}"]
 
             # Special-case normalization for common multi-value patterns,
             # e.g. "I have two dogs: one named Enola, and the other named Glacier"
             # or "I have two cats named Barcelona and Jesus".
-            dogs_pattern_1 = re.match(
-                r"i have two dogs: one named ([^,]+),?\s*and the other(?: is)? named ([^,]+)",
-                clause,
-                re.IGNORECASE,
-            )
-            dogs_pattern_2 = None
-            if not dogs_pattern_1:
-                dogs_pattern_2 = re.match(
-                    r"two dogs: one named ([^,]+),?\s*and the other(?: is)? named ([^,]+)",
-                    clause,
-                    re.IGNORECASE,
-                )
-            dogs_match = dogs_pattern_1 or dogs_pattern_2
+            dogs_match = _DOGS_PATTERN_1.match(clause) or _DOGS_PATTERN_2.match(clause)
             if dogs_match:
                 first = dogs_match.group(1).strip()
                 second = dogs_match.group(2).strip()
@@ -191,19 +292,7 @@ class HybridMemorySystem:
             # Generic multi-entity pattern: "I have two cats named A and B" or
             # "two cats named A and B". We canonicalize as "cats: A, B" so that
             # downstream code can treat it like any other field:value fact.
-            multi_1 = re.match(
-                r"i have\s+(\w+)\s+(\w+)s\s+named\s+([^,]+),?\s*(?:and|, and)\s*([^,]+)",
-                clause,
-                re.IGNORECASE,
-            )
-            multi_2 = None
-            if not multi_1:
-                multi_2 = re.match(
-                    r"(\w+)\s+(\w+)s\s+named\s+([^,]+),?\s*(?:and|, and)\s*([^,]+)",
-                    clause,
-                    re.IGNORECASE,
-                )
-            multi = multi_1 or multi_2
+            multi = _MULTI_ENTITY_1.match(clause) or _MULTI_ENTITY_2.match(clause)
             if multi:
                 _, type_word, first, second = multi.groups()
                 field = type_word.rstrip('s').lower() + 's'
@@ -225,25 +314,16 @@ class HybridMemorySystem:
 
     def _extract_explicit_commands(self, text: str) -> List[Dict]:
         """Parse explicit memory commands from user input"""
-        # Order is important: handle more structured patterns first so we can
-        # prefer key:value style facts and avoid redundant entries.
-        patterns = [
-            (r"my (\w+) is (.+)", None),  # dynamic key:value (name: Hunter)
-            (r"remember that (.+)", "fact"),
-            (r"remember (?!that\b)(.+)", "fact"),
-            (r"(?:don't forget|note that) (.+)", "fact"),
-            (r"i have (.+)", "fact"),
-            (r"i (?:work at|live in|prefer|hate|love|need) (.+)", "preference"),
-            (r"i'm (?:a|an) (.+)", "identity"),
-        ]
-
+        # Use precompiled patterns for performance
         extracted: List[Dict] = []
         seen_contents = set()
 
-        for pattern, mem_type in patterns:
-            matches = re.finditer(pattern, text, re.IGNORECASE)
+        for pattern, mem_type in _EXPLICIT_PATTERNS:
+            matches = pattern.finditer(text)
             for match in matches:
-                contents = self._normalize_explicit_match(pattern, mem_type, match)
+                # Get pattern string for normalization logic
+                pattern_str = pattern.pattern
+                contents = self._normalize_explicit_match(pattern_str, mem_type, match)
                 for content in contents:
                     content = content.strip()
                     if not content or content in seen_contents:
@@ -349,7 +429,7 @@ class HybridMemorySystem:
 
             # If this looks like a canonical "field: value" fact, deduplicate on the
             # field name so only the latest value is kept (e.g. only one "name: ...").
-            field_match = re.match(r"^(\w+):\s*(.+)$", content)
+            field_match = _FIELD_VALUE_PATTERN.match(content)
             if field_match:
                 field = field_match.group(1).strip().lower()
                 # Remove any older facts for the same logical field for this user/type.
@@ -438,11 +518,14 @@ class HybridMemorySystem:
         explicit_memories = []
         for mem_id, score in explicit_results:
             if score > 0.0:  # Similarity threshold (lowered for mock embedding)
-                meta = self.vector_store.metadata[mem_id]
-                explicit_memories.append({
-                    "content": meta["text"],
-                    "relevance": score
-                })
+                # Find metadata by id
+                idx = self.vector_store.id_to_index.get(mem_id)
+                if idx is not None:
+                    meta = self.vector_store.metadata[idx]
+                    explicit_memories.append({
+                        "content": meta["text"],
+                        "relevance": score
+                    })
         
         # Fallback: if nothing surfaced via the vector store (e.g., in tests or
         # with the mock embedding), include the most recent explicit memories
@@ -486,7 +569,7 @@ class HybridMemorySystem:
         consolidated: dict = {}
         for mem in explicit_memories:
             text = mem["content"]
-            m = re.match(r"^(\w+):\s*(.+)$", text)
+            m = _FIELD_VALUE_PATTERN.match(text)
             if m:
                 field = m.group(1).strip().lower()
                 key = ("field", field)

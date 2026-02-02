@@ -155,6 +155,59 @@ make shell
 
 You can explore or extend the memory behavior by editing `ai_memory_system.py` and adjusting the patterns or scoring logic for explicit and implicit memories.
 
+## Performance Improvements
+
+This repository includes several performance optimizations for production use:
+
+### Numpy-Matrix Vector Store
+
+The in-memory vector store uses a numpy matrix-backed implementation with vectorized operations:
+
+- Contiguous float32 matrix storage for fast BLAS-backed dot products
+- Vectorized similarity search using numpy operations
+- Efficient top-k selection via `argpartition` (partial sorting)
+- Pre-normalized embeddings stored at insertion time
+
+This provides significant speedup over Python-loop-based similarity search, especially for larger memory stores.
+
+### SQLite Tuning
+
+The SQLite database includes performance optimizations:
+
+- **WAL (Write-Ahead Logging)** mode for better concurrency
+- **NORMAL synchronous** setting for improved throughput
+- Indexes on common query patterns:
+  - `idx_conversation_user_ts` on `conversation_turns(user_id, timestamp DESC)`
+  - `idx_implicit_user` on `implicit_memories(user_id)`
+  - `idx_explicit_user` on `explicit_memories(user_id)`
+
+### Persistent Embedding Cache
+
+A SQLite-backed persistent cache stores embeddings to avoid redundant API calls:
+
+- Two-tier caching: in-memory dict + persistent disk cache
+- Default cache location: `data/embeddings_cache.db`
+- Override with `EMBEDDING_CACHE_DB` environment variable
+- Keyed by model name and normalized text hash (SHA256)
+- Embeddings stored as raw bytes with dtype/dimension metadata
+
+**Example usage:**
+```bash
+# Use default cache location
+python cli.py
+
+# Or specify custom cache path
+EMBEDDING_CACHE_DB=/path/to/cache.db python cli.py
+```
+
+The embedding cache is most beneficial when using real embedding models (e.g., with `AI_EMBEDDING_BACKEND=ollama`), but is transparent when using the default mock backend.
+
+### Other Optimizations
+
+- Precompiled regex patterns for explicit memory extraction
+- Vectorized user_id filtering in search using boolean masks
+- Reduced memory overhead with float32 embeddings
+
 ## Testing
 
 Tests live under the standard `tests/` directory. Run them with:
