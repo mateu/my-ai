@@ -6,7 +6,6 @@ from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 import re
 import hashlib
-from functools import lru_cache
 
 from .embedding_cache import EmbeddingCache
 
@@ -62,7 +61,7 @@ class VectorStore:
         """Add a normalized vector to the store."""
         # Normalize embedding to unit length and ensure float32
         emb_norm = embedding.astype(np.float32) / np.linalg.norm(embedding)
-        emb_norm = emb_norm.reshape(1, -1).astype(np.float32)  # Shape: (1, D) and ensure float32
+        emb_norm = emb_norm.reshape(1, -1)  # Shape: (1, D)
         
         # Check if id already exists
         if id in self.id_to_index:
