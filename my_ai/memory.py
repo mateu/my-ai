@@ -79,12 +79,149 @@ class HybridMemorySystem:
         conn.close()
     
     def _get_embedding(self, text: str) -> np.ndarray:
-        """Mock embedding using hash-based approach (deterministic but meaningless - swap for real model)"""
-        # In production: use sentence-transformers or OpenAI embeddings
-        text = text.lower()
-        np.random.seed(int(hashlib.md5(text.encode()).hexdigest(), 16) % (2**32))
+        """Get an embedding for `text` using a configurable backend.
+
+        By default we use a mock, hash-based embedding so tests and offline runs
+        do not depend on a real model. If AI_EMBEDDING_BACKEND="ollama" is set,
+        we call an Ollama embedding model instead (e.g. nomic-embed-text).
+        """
+        backend = os.getenv("AI_EMBEDDING_BACKEND", "mock").lower()
+
+        # Fast, deterministic mock for tests and simple local runs.
+        if backend == "mock":
+            text_norm = text.lower()
+            np.random.seed(int(hashlib.md5(text_norm.encode()).hexdigest(), 16) % (2**32))
+            return np.random.randn(self.vector_store.dim).astype(np.float32)
+
+        if backend == "ollama":
+            import requests
+
+            # Allow overriding the embedding model and URL via environment.
+            # Default to a general-purpose text embedding model.
+            model = os.getenv("OLLAMA_EMBED_MODEL", os.getenv("AI_EMBED_MODEL", "nomic-embed-text:latest"))
+            base_url = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+            url = f"{base_url}/api/embed"
+
+            cache_key = (backend, model, text)
+            if cache_key in self.embeddings_cache:
+                return self.embeddings_cache[cache_key]
+
+            try:
+                resp = requests.post(
+                    url,
+                    json={"model": model, "input": text},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+                # Ollama's /api/embed returns { "embeddings": [[...]] } or {"embedding": [...]}
+                emb = None
+                if isinstance(data.get("embeddings"), list) and data["embeddings"]:
+                    emb = data["embeddings"][0]
+                elif isinstance(data.get("embedding"), list):
+                    emb = data["embedding"]
+
+                if not emb:
+                    raise ValueError(f"Unexpected Ollama embed response: {data}")
+
+                vec = np.array(emb, dtype=np.float32)
+                # Optionally pad/trim to our VectorStore dim to keep interfaces simple.
+                if vec.shape[0] != self.vector_store.dim:
+                    if vec.shape[0] > self.vector_store.dim:
+                        vec = vec[: self.vector_store.dim]
+                    else:
+                        pad = self.vector_store.dim - vec.shape[0]
+                        vec = np.pad(vec, (0, pad))
+
+                self.embeddings_cache[cache_key] = vec
+                return vec
+            except Exception:
+                # Fall back to mock embedding if Ollama is unavailable or misconfigured.
+                text_norm = text.lower()
+                np.random.seed(int(hashlib.md5(text_norm.encode()).hexdigest(), 16) % (2**32))
+                return np.random.randn(self.vector_store.dim).astype(np.float32)
+
+        # Unknown backend: fall back to mock.
+        text_norm = text.lower()
+        np.random.seed(int(hashlib.md5(text_norm.encode()).hexdigest(), 16) % (2**32))
         return np.random.randn(self.vector_store.dim).astype(np.float32)
     
+
+    def _normalize_explicit_match(self, pattern: str, mem_type: str | None, match: re.Match) -> list[str]:
+        """Normalize a single regex match into one or more canonical fact strings.
+
+        Today we always return a single fact string, but this helper gives us a
+        dedicated place to evolve more complex parsing (multiple facts, richer
+        structures) without bloating _extract_explicit_commands.
+        """
+        # Pattern-specific handling for "my X is Y" which we treat as key:value.
+        if pattern.startswith("my "):
+            return [f"{match.group(1)}: {match.group(2)}"]
+
+        if mem_type:
+            clause = match.group(1)
+            # If a generic wrapper like "remember that ..." contains a more
+            # structured "my X is Y" pattern, normalize that too.
+            sub = re.match(r"my (\w+) is (.+)", clause, re.IGNORECASE)
+            if sub:
+                return [f"{sub.group(1)}: {sub.group(2)}"]
+
+            # Special-case normalization for common multi-value patterns,
+            # e.g. "I have two dogs: one named Enola, and the other named Glacier"
+            # or "I have two cats named Barcelona and Jesus".
+            dogs_pattern_1 = re.match(
+                r"i have two dogs: one named ([^,]+),?\s*and the other(?: is)? named ([^,]+)",
+                clause,
+                re.IGNORECASE,
+            )
+            dogs_pattern_2 = None
+            if not dogs_pattern_1:
+                dogs_pattern_2 = re.match(
+                    r"two dogs: one named ([^,]+),?\s*and the other(?: is)? named ([^,]+)",
+                    clause,
+                    re.IGNORECASE,
+                )
+            dogs_match = dogs_pattern_1 or dogs_pattern_2
+            if dogs_match:
+                first = dogs_match.group(1).strip()
+                second = dogs_match.group(2).strip()
+                return [f"dogs: {first}, {second}"]
+
+            # Generic multi-entity pattern: "I have two cats named A and B" or
+            # "two cats named A and B". We canonicalize as "cats: A, B" so that
+            # downstream code can treat it like any other field:value fact.
+            multi_1 = re.match(
+                r"i have\s+(\w+)\s+(\w+)s\s+named\s+([^,]+),?\s*(?:and|, and)\s*([^,]+)",
+                clause,
+                re.IGNORECASE,
+            )
+            multi_2 = None
+            if not multi_1:
+                multi_2 = re.match(
+                    r"(\w+)\s+(\w+)s\s+named\s+([^,]+),?\s*(?:and|, and)\s*([^,]+)",
+                    clause,
+                    re.IGNORECASE,
+                )
+            multi = multi_1 or multi_2
+            if multi:
+                _, type_word, first, second = multi.groups()
+                field = type_word.rstrip('s').lower() + 's'
+                return [f"{field}: {first.strip()}, {second.strip()}"]
+
+            # For generic wrappers like "remember that ...", avoid storing the
+            # wrapper tokens themselves ("that", etc.) when the clause is a
+            # simple prefix like "that X".
+            lowered = clause.strip().lower()
+            if lowered.startswith("that ") and len(clause.split()) > 1:
+                return [clause.split(None, 1)[1]]
+
+            # Default: return the clause as-is.
+            return [clause]
+
+        # Fallback, though in practice only the first pattern uses mem_type=None.
+        return [match.group(1)]
+
 
     def _extract_explicit_commands(self, text: str) -> List[Dict]:
         """Parse explicit memory commands from user input"""
@@ -93,7 +230,9 @@ class HybridMemorySystem:
         patterns = [
             (r"my (\w+) is (.+)", None),  # dynamic key:value (name: Hunter)
             (r"remember that (.+)", "fact"),
+            (r"remember (?!that\b)(.+)", "fact"),
             (r"(?:don't forget|note that) (.+)", "fact"),
+            (r"i have (.+)", "fact"),
             (r"i (?:work at|live in|prefer|hate|love|need) (.+)", "preference"),
             (r"i'm (?:a|an) (.+)", "identity"),
         ]
@@ -104,32 +243,18 @@ class HybridMemorySystem:
         for pattern, mem_type in patterns:
             matches = re.finditer(pattern, text, re.IGNORECASE)
             for match in matches:
-                if pattern.startswith("my "):
-                    # Canonical key:value form, e.g. "name: Hunter"
-                    content = f"{match.group(1)}: {match.group(2)}"
-                elif mem_type:
-                    clause = match.group(1)
-                    # If a generic wrapper like "remember that ..." contains a
-                    # more structured "my X is Y" pattern, normalize that too.
-                    sub = re.match(r"my (\w+) is (.+)", clause, re.IGNORECASE)
-                    if sub:
-                        content = f"{sub.group(1)}: {sub.group(2)}"
-                    else:
-                        content = clause
-                else:
-                    # Fallback, though in practice only the first pattern uses mem_type=None.
-                    content = match.group(1)
+                contents = self._normalize_explicit_match(pattern, mem_type, match)
+                for content in contents:
+                    content = content.strip()
+                    if not content or content in seen_contents:
+                        continue
+                    seen_contents.add(content)
 
-                content = content.strip()
-                if content in seen_contents:
-                    continue
-                seen_contents.add(content)
-
-                extracted.append({
-                    "type": mem_type or "fact",
-                    "content": content,
-                    "source": "user_command",
-                })
+                    extracted.append({
+                        "type": mem_type or "fact",
+                        "content": content,
+                        "source": "user_command",
+                    })
         return extracted
 
     def _extract_implicit_traits(self, user_id: str) -> List[Dict]:
@@ -245,7 +370,14 @@ class HybridMemorySystem:
 
             existing = c.fetchone()
             if existing:
-                # Refresh timestamp / source on the existing row.
+                # If we already have the canonical fact for this field, skip storing
+                # a redundant non-canonical variant of the same underlying fact.
+                if field_match is not None:
+                    conn.commit()
+                    conn.close()
+                    return
+
+                # Otherwise, refresh timestamp / source on the existing row.
                 c.execute(
                     "UPDATE explicit_memories SET created_at = ?, source = ? "
                     "WHERE id = ?",
@@ -315,22 +447,40 @@ class HybridMemorySystem:
         # Fallback: if nothing surfaced via the vector store (e.g., in tests or
         # with the mock embedding), include the most recent explicit memories
         # directly from SQLite so important facts like a user's name are always
-        # available to the LLM.
+        # available to the LLM. Even when we *do* have vector hits, we also
+        # augment them with a few of the most recent facts so that very fresh
+        # memories (like a newly mentioned pet) are unlikely to be dropped by a
+        # noisy embedding similarity score.
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
+        
+        c.execute(
+            """SELECT content FROM explicit_memories
+               WHERE user_id = ?
+               ORDER BY datetime(created_at) DESC
+               LIMIT 5""",
+            (user_id,),
+        )
+        recent_rows = [content for (content,) in c.fetchall()]
+
         if not explicit_memories:
-            c.execute(
-                """SELECT content FROM explicit_memories
-                   WHERE user_id = ?
-                   ORDER BY datetime(created_at) DESC
-                   LIMIT 5""",
-                (user_id,),
-            )
-            for (content,) in c.fetchall():
+            # No vector hits at all: just use the most recent facts.
+            for content in recent_rows:
                 explicit_memories.append({
                     "content": content,
                     "relevance": 1.0,
                 })
+        else:
+            # We already have some vector-surfaced facts; make sure we also
+            # include a few of the latest explicit memories so that brand-new
+            # facts are always candidates for the prompt.
+            existing_texts = {m["content"] for m in explicit_memories}
+            for content in recent_rows:
+                if content not in existing_texts:
+                    explicit_memories.append({
+                        "content": content,
+                        "relevance": 1.0,
+                    })
 
         # Consolidate explicit facts by logical field to avoid redundant variants.
         consolidated: dict = {}

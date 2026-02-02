@@ -152,6 +152,14 @@ def interactive_chat():
                 print("  /save            Snapshot the current memory DB to data/chat_memory_YYYYMMDD_HHMMSS.db")
                 print("  /load <file>     Load a saved DB file into the active session")
                 print("  (Anything else)  Is treated as a normal message to the assistant")
+                print("\nHow to teach me explicit memories:")
+                print("  - 'my name is Hunter'")
+                print("  - 'remember that my dog is Enola'")
+                print("  - 'remember I have two dogs named Enola and Glacier'")
+                print("  - 'I have two dogs: one named Enola, and the other named Glacier'")
+                print("  - 'don't forget that I hate spicy food'")
+                print("  - 'I work at OpenAI' or 'I'm a software engineer'")
+                print("These patterns are stored as explicit memories and surfaced under [Known Facts]/[Observed Preferences].")
                 continue
 
             if user_input.lower() == "/quit":
