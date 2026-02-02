@@ -2,15 +2,16 @@ from typing import List, Tuple, Dict, Optional
 import os
 import numpy as np
 import chromadb
-from chromadb.config import Settings
 
 class ChromaAdapter:
     """Adapter that exposes add/search/persist and a metadata dict to mimic VectorStore."""
 
     def __init__(self, collection_name: str = "memories", persist_directory: Optional[str] = None, embedding_dim: int = 384):
         self.embedding_dim = embedding_dim
+        self.dim = embedding_dim  # Alias for compatibility with VectorStore
         persist_directory = persist_directory or os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
-        self.client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=persist_directory))
+        # Use the modern PersistentClient instead of deprecated Settings
+        self.client = chromadb.PersistentClient(path=persist_directory)
         # get_or_create_collection ensures idempotence
         self.collection = self.client.get_or_create_collection(name=collection_name)
         # keep a lightweight in-memory metadata cache for compatibility
@@ -77,8 +78,5 @@ class ChromaAdapter:
             return []
 
     def persist(self):
-        try:
-            self.client.persist()
-        except Exception:
-            # not all client setups need explicit persist; ignore errors here
-            pass
+        # PersistentClient automatically persists, so this is a no-op for compatibility
+        pass
