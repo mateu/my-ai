@@ -19,10 +19,26 @@ def test_cli_end_to_end(tmp_path):
 
     # Run the CLI in an isolated temp directory, copying just what we need.
     workdir = tmp_path
-    for fname in ["cli.py", "ai_memory_system.py"]:
-        src = project_root / fname
-        dst = workdir / fname
-        dst.write_text(src.read_text())
+
+    # Copy cli.py
+    src_cli = project_root / "cli.py"
+    dst_cli = workdir / "cli.py"
+    dst_cli.write_text(src_cli.read_text())
+
+    # Copy the my_ai package directory recursively so imports still work.
+    src_pkg = project_root / "my_ai"
+    dst_pkg = workdir / "my_ai"
+    dst_pkg.mkdir(parents=True, exist_ok=True)
+    for sub in src_pkg.rglob("*"):
+        # Skip compiled artifacts; we only need source files for the test.
+        if "__pycache__" in sub.parts:
+            continue
+        rel = sub.relative_to(src_pkg)
+        target = dst_pkg / rel
+        if sub.is_dir():
+            target.mkdir(parents=True, exist_ok=True)
+        else:
+            target.write_text(sub.read_text())
 
     env = os.environ.copy()
     # Disable real network calls in generate_response

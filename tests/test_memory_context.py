@@ -1,12 +1,12 @@
 import sqlite3
 
-from ai_memory_system import HybridMemorySystem
+from my_ai import HybridMemorySystem
 
 
 def test_get_context_and_format_for_prompt_smoke(tmp_path):
     """Smoke test for end-to-end explicit memory → context → prompt formatting.
 
-    This is a lean version of the old demo() flow in ai_memory_system.py.
+    This is a lean version of the old demo() flow from the original core module.
     It ensures that:
     - explicit memories are extracted and stored
     - get_context returns them

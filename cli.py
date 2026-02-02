@@ -1,4 +1,4 @@
-from ai_memory_system import HybridMemorySystem
+from my_ai import HybridMemorySystem
 import os
 import shutil
 from openai import OpenAI

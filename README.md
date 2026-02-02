@@ -13,7 +13,7 @@ The project currently ships a simple CLI that lets you chat while the system lea
 
 ## Project layout
 
-- `ai_memory_system.py` – core `HybridMemorySystem` implementation (explicit/implicit memories, vector store, SQLite schema).
+- `my_ai/memory.py` – core `HybridMemorySystem` implementation (explicit/implicit memories, vector store, SQLite schema).
 - `cli.py` – interactive chat loop that uses `HybridMemorySystem`.
 - `data/` – SQLite database files created at runtime (e.g. `data/chat_memory.db`, `data/chat_memory_*.db`).
 - `pyproject.toml` – dependency and environment management (via `uv`).
