@@ -153,7 +153,45 @@ uv run cli.py
 make shell
 ```
 
-You can explore or extend the memory behavior by editing `ai_memory_system.py` and adjusting the patterns or scoring logic for explicit and implicit memories.
+You can explore or extend the memory behavior by editing `my_ai/memory.py` and adjusting the patterns or scoring logic for explicit and implicit memories.
+
+## Optional: Performance Improvements
+
+This project includes several performance optimizations:
+
+### Numpy-Matrix Vector Store
+
+The default in-memory vector store uses a vectorized numpy implementation with:
+- Contiguous float32 matrix (N x D) for normalized vectors
+- Single BLAS-backed dot product for fast similarity search
+- Efficient numpy masking and top-k selection using argpartition
+
+### SQLite Performance Tuning
+
+The database is automatically configured with performance optimizations:
+- `PRAGMA journal_mode = WAL` for better concurrent access
+- `PRAGMA synchronous = NORMAL` for faster writes
+- Indexes on frequently-queried columns for faster lookups
+
+### Persistent Embedding Cache
+
+To avoid recomputing embeddings, a persistent SQLite cache is used:
+- Default location: `data/embeddings_cache.db`
+- Override via environment variable: `EMBEDDING_CACHE_DB=/path/to/cache.db`
+- Includes in-memory LRU cache for fast access during process lifetime
+- Works with both mock and real (Ollama) embedding backends
+
+### Default Ollama Embedding Model
+
+When using Ollama embeddings (`AI_EMBEDDING_BACKEND=ollama`):
+- Default model: `qwen3-embedding:0.6b` (faster and more efficient)
+- Override via: `OLLAMA_EMBED_MODEL=your-model-name` or `AI_EMBED_MODEL=your-model-name`
+
+### Chroma Vector Backend (Optional)
+
+For production use with persistent vector storage, you can use the Chroma adapter:
+- Set `VECTOR_DB=chroma` to use Chroma instead of the in-memory store
+- Note: This requires the chromadb package (see Chroma-specific branch/PR)
 
 ## Testing
 
