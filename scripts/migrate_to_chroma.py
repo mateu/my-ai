@@ -32,8 +32,9 @@ def main(db_path="data/chat_memory.db", user_filter: str | None = None):
     # persist to disk (Chroma)
     try:
         mem.vector_store.persist()
-    except Exception:
-        pass
+    except Exception as e:
+        import warnings
+        warnings.warn(f"Failed to persist Chroma data: {e}")
     conn.close()
 
 if __name__ == "__main__":

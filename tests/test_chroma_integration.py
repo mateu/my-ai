@@ -21,8 +21,11 @@ def test_chroma_integration():
     """Test that HybridMemorySystem works with Chroma backend."""
     print("Testing Chroma integration...")
     
-    # Create temp directories
-    temp_db = tempfile.mktemp(suffix=".db")
+    # Create temp directories using NamedTemporaryFile for safety
+    import tempfile
+    temp_db_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    temp_db = temp_db_file.name
+    temp_db_file.close()
     temp_chroma = tempfile.mkdtemp()
     
     try:
@@ -89,7 +92,9 @@ def test_fallback_to_in_memory():
     """Test that the system falls back to in-memory when Chroma is not specified."""
     print("\nTesting fallback to in-memory VectorStore...")
     
-    temp_db = tempfile.mktemp(suffix=".db")
+    temp_db_file = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    temp_db = temp_db_file.name
+    temp_db_file.close()
     
     try:
         # Don't set VECTOR_DB, should default to in-memory

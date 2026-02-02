@@ -74,7 +74,9 @@ class ChromaAdapter:
                     score = float(dist)
                 out.append((_id, score))
             return out
-        except Exception:
+        except Exception as e:
+            import warnings
+            warnings.warn(f"Chroma search failed, returning empty results: {e}")
             return []
 
     def persist(self):

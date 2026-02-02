@@ -56,8 +56,10 @@ class HybridMemorySystem:
                 from my_ai.vector_backends.chroma_adapter import ChromaAdapter
                 persist_dir = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
                 self.vector_store = ChromaAdapter(persist_directory=persist_dir, embedding_dim=384)
-            except Exception:
+            except Exception as e:
                 # fallback to in-memory if chroma isn't available
+                import warnings
+                warnings.warn(f"Failed to initialize Chroma backend, falling back to in-memory VectorStore: {e}")
                 self.vector_store = VectorStore()
         else:
             # default in-memory vector store (existing)
