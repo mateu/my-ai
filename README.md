@@ -154,3 +154,10 @@ make shell
 ```
 
 You can explore or extend the memory behavior by editing `ai_memory_system.py` and adjusting the patterns or scoring logic for explicit and implicit memories.
+
+## Testing
+
+Tests live under the standard `tests/` directory. Run them with:
+
+- `make test` (preferred) — runs `uv run pytest -vv tests`
+- Or `uv run pytest -vv tests` directly

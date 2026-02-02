@@ -2,28 +2,10 @@ import sqlite3
 import os
 import json
 import numpy as np
-from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime, timedelta
 import re
 import hashlib
-
-@dataclass
-class ExplicitMemory:
-    user_id: str
-    memory_type: str  # 'fact', 'preference', 'constraint'
-    content: str
-    created_at: str
-    source: str  # 'user_command', 'inferred'
-    
-@dataclass
-class ImplicitMemory:
-    user_id: str
-    category: str  # 'communication', 'technical', 'domain'
-    pattern: str
-    confidence: float
-    last_observed: str
-    decay_factor: float = 0.95
 
 class VectorStore:
     """Simple in-memory vector store using numpy (replace with Chroma/Pinecone in prod)"""
@@ -351,52 +333,3 @@ class HybridMemorySystem:
             sections.append(f"[Observed Preferences]\n{patterns_text}")
         
         return "\n\n".join(sections) if sections else ""
-
-# Demo Usage
-def demo():
-    memory = HybridMemorySystem()
-    user_id = "user_123"
-    
-    print("=== Simulating Conversation ===\n")
-    
-    # Turn 1: Explicit memory
-    msg1 = "Remember that I work at OpenAI and I prefer concise technical answers."
-    print(f"User: {msg1}")
-    memory.store_interaction(user_id, "user", msg1)
-    
-    # Assistant response
-    memory.store_interaction(user_id, "assistant", "Noted. I'll keep my responses brief and technical.")
-    
-    # Turn 2-6: Build up history for implicit extraction
-    messages = [
-        "How do I optimize a Python function?",
-        "What's the time complexity of a hash map lookup?",
-        "Can you show me the code for a LRU cache?",
-        "I need to handle async database calls in Python",
-        "Write a decorator for timing functions"
-    ]
-    
-    for i, msg in enumerate(messages, 2):
-        print(f"User: {msg}")
-        memory.store_interaction(user_id, "user", msg)
-        memory.store_interaction(user_id, "assistant", f"Response {i}...")
-        print(f"  [Stored turn, implicit batch trigger: {i % 5 == 0}]")
-    
-    print("\n=== Retrieving Context ===\n")
-    
-    # Query the memory system
-    test_queries = [
-        "How should I structure my code?",
-        "Tell me about databases",
-        "What do I do for work?"
-    ]
-    
-    for query in test_queries:
-        print(f"Query: '{query}'")
-        context = memory.get_context(user_id, query)
-        prompt_addition = memory.format_for_prompt(context)
-        print(f"Injected Context:\n{prompt_addition}\n")
-        print("-" * 50)
-
-if __name__ == "__main__":
-    demo()

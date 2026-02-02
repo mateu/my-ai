@@ -14,7 +14,8 @@ def test_cli_end_to_end(tmp_path):
     - Quits cleanly with /quit.
     """
 
-    project_root = Path(__file__).resolve().parent
+    # tests/ lives one level below the project root; climb up to find cli.py, etc.
+    project_root = Path(__file__).resolve().parents[1]
 
     # Run the CLI in an isolated temp directory, copying just what we need.
     workdir = tmp_path

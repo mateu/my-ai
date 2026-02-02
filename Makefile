@@ -10,5 +10,6 @@ shell:
 	uv run python
 
 # Run the test suite (verbose)
+# Tests live under the standard tests/ directory.
 test tests:
-	uv run pytest -vv
+	uv run pytest -vv tests
