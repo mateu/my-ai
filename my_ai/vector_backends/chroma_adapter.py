@@ -14,7 +14,7 @@ class ChromaAdapter:
     - persist()
     - metadata dict for compatibility
     
-    Uses chromadb.Client with duckdb+parquet persist_directory.
+    Uses chromadb.PersistentClient with duckdb+parquet persist_directory.
     Converts Chroma distances into similarity-like scores (1 - distance).
     Handles dimension padding/trimming to match configured embedding dimension.
     """
@@ -130,10 +130,10 @@ class ChromaAdapter:
         query_vec = self._normalize_embedding(query_emb)
         
         # Query Chroma with filtering
-        # Note: We query for more results initially to account for filtering
+        # Chroma handles user_id filtering natively, so we query for exactly top_k
         results = self.collection.query(
             query_embeddings=[query_vec.tolist()],
-            n_results=min(top_k * 10, 100),  # Query more to account for filtering
+            n_results=top_k,
             where={"user_id": user_id} if user_id else None,
             include=["distances", "metadatas"]
         )

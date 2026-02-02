@@ -15,6 +15,7 @@ Environment variables:
 """
 
 import argparse
+import hashlib
 import os
 import sqlite3
 import sys
@@ -88,7 +89,9 @@ def migrate_to_chroma(db_path: str = None):
         embedding = memory_system._get_embedding(content)
         
         # Create memory ID (same format as used in _store_explicit_memory)
-        mem_id = f"{user_id}_explicit_{hash(content)}"
+        # Use deterministic hash for consistent IDs across runs
+        content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()[:16]
+        mem_id = f"{user_id}_explicit_{content_hash}"
         
         # Add to vector store (ChromaAdapter)
         memory_system.vector_store.add(

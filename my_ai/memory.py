@@ -411,9 +411,10 @@ class HybridMemorySystem:
 
             # Add to vector store for retrieval.
             emb = self._get_embedding(content)
-            mem_id = f"{user_id}_explicit_{hash(content)}"
+            # Use deterministic hash for consistent IDs across runs
+            content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()[:16]
+            mem_id = f"{user_id}_explicit_{content_hash}"
             self.vector_store.add(mem_id, content, {"user_id": user_id, "type": "explicit"}, emb)
-
 
 
     def _store_implicit_memory(self, user_id: str, trait: Dict):
