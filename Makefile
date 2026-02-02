@@ -5,7 +5,7 @@
 #   OLLAMA_URL=http://localhost:11434 make run-ollama
 #   OLLAMA_MODEL=deepseek-r1:1.5b make run-ollama
 OLLAMA_URL ?= http://192.168.1.52:11434
-OLLAMA_MODEL ?= memory-bot:latest
+OLLAMA_MODEL ?= llama3.2:3b
 
 # Start the interactive chat CLI using the Ollama backend by default.
 # `make run` is an alias for `make run-ollama`.

@@ -51,10 +51,10 @@ When answering about the user (their pets, preferences, biography, etc.):
 
 You may still use general world knowledge for non-user-specific questions.
 """.strip()
-    
+
     if context:
         system_prompt += f"\n\nRelevant context about the user:\n{context}"
-    
+
     try:
         backend = os.getenv("AI_BACKEND", "openai").lower()
 
@@ -62,7 +62,7 @@ You may still use general world knowledge for non-user-specific questions.
         # sensible defaults for tests and local usage.
         if backend == "ollama":
             # Priority: explicit OLLAMA_MODEL, then AI_MODEL, then a sensible local default.
-            model = os.getenv("OLLAMA_MODEL") or os.getenv("AI_MODEL") or "memory-bot:latest"
+            model = os.getenv("OLLAMA_MODEL") or os.getenv("AI_MODEL") or "llama3.2:3b"
         else:
             model = os.getenv("AI_MODEL", "gpt-3.5-turbo")
 
@@ -103,7 +103,7 @@ You may still use general world knowledge for non-user-specific questions.
             max_tokens=500
         )
         return response.choices[0].message.content
-        
+
     except Exception as e:
         return f"Error calling LLM: {str(e)}"
 
@@ -230,6 +230,13 @@ def interactive_chat():
                     print(f"Error loading database: {e}")
                 continue
 
+
+            # Fast-path: if this is a pure remember command, handle it directly
+            # without invoking the LLM. This is faster and avoids confusing the model.
+            if memory.is_remember_command(user_input):
+                response = memory.process_remember_command(user_id, user_input)
+                print(f"Assistant: {response}")
+                continue
             # Normal conversation flow
             # 1. Store user message
             memory.store_interaction(user_id, "user", user_input)

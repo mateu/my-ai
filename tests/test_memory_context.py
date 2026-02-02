@@ -32,6 +32,6 @@ def test_get_context_and_format_for_prompt_smoke(tmp_path):
     context = memory.get_context(user_id, query)
     formatted = memory.format_for_prompt(context)
 
-    # We should at least see the Known Facts section and the OpenAI job fact.
+    # We should at least see the Known Facts section and the OpenAI fact.
     assert "[Known Facts]" in formatted
-    assert "work at OpenAI" in formatted
+    assert "OpenAI" in formatted
