@@ -49,7 +49,7 @@ AI Memory is a hybrid memory system for LLM-powered assistants that combines exp
 The project uses `.env` file for configuration:
 - `OPENAI_API_KEY` - For OpenAI backend
 - `AI_BACKEND` - Set to "openai" or "ollama"
-- `OLLAMA_URL` - URL for Ollama server (default: http://192.168.1.52:11434)
+- `OLLAMA_URL` - URL for Ollama server (default: http://localhost:11434)
 - `OLLAMA_MODEL` - Ollama model name (default: memory-bot:latest)
 
 ## Important Notes
