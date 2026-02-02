@@ -1,0 +1,402 @@
+import sqlite3
+import os
+import json
+import numpy as np
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime, timedelta
+import re
+import hashlib
+
+@dataclass
+class ExplicitMemory:
+    user_id: str
+    memory_type: str  # 'fact', 'preference', 'constraint'
+    content: str
+    created_at: str
+    source: str  # 'user_command', 'inferred'
+    
+@dataclass
+class ImplicitMemory:
+    user_id: str
+    category: str  # 'communication', 'technical', 'domain'
+    pattern: str
+    confidence: float
+    last_observed: str
+    decay_factor: float = 0.95
+
+class VectorStore:
+    """Simple in-memory vector store using numpy (replace with Chroma/Pinecone in prod)"""
+    def __init__(self, dim: int = 384):  # all-MiniLM-L6-v2 dimension
+        self.dim = dim
+        self.vectors: Dict[str, np.ndarray] = {}  # id -> vector
+        self.metadata: Dict[str, dict] = {}       # id -> metadata
+        
+    def add(self, id: str, text: str, metadata: dict, embedding: np.ndarray):
+        self.vectors[id] = embedding / np.linalg.norm(embedding)  # normalize
+        self.metadata[id] = {**metadata, "text": text}
+    
+    def search(self, query_emb: np.ndarray, user_id: str, top_k: int = 3) -> List[Tuple[str, float]]:
+        """Return top_k matches filtered by user_id"""
+        query_norm = query_emb / np.linalg.norm(query_emb)
+        results = []
+        
+        for id, vec in self.vectors.items():
+            meta = self.metadata[id]
+            if meta.get("user_id") != user_id:
+                continue
+            # Cosine similarity
+            score = float(np.dot(query_norm, vec))
+            results.append((id, score))
+            
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:top_k]
+
+class HybridMemorySystem:
+    def __init__(self, db_path: str | None = None):
+        if db_path is None:
+            db_path = os.path.join("data", "memory.db")
+
+        # Ensure directory for the DB exists if it is relative and has a parent
+        if not os.path.isabs(db_path):
+            db_dir = os.path.dirname(db_path)
+            if db_dir:
+                os.makedirs(db_dir, exist_ok=True)
+
+        self.db_path = db_path
+        self.vector_store = VectorStore()
+        self.embeddings_cache = {}  # Simple embedding cache
+        
+        # Mock embedding function (replace with real model)
+        self.mock_vocabulary = {}
+        
+        self._init_db()
+        
+    def _init_db(self):
+        """Initialize SQLite tables"""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        
+        # Explicit memories
+        c.execute('''CREATE TABLE IF NOT EXISTS explicit_memories
+                     (id INTEGER PRIMARY KEY, user_id TEXT, memory_type TEXT, 
+                      content TEXT, created_at TEXT, source TEXT)''')
+        
+        # Implicit memories
+        c.execute('''CREATE TABLE IF NOT EXISTS implicit_memories
+                     (id INTEGER PRIMARY KEY, user_id TEXT, category TEXT,
+                      pattern TEXT, confidence REAL, last_observed TEXT, 
+                      decay_factor REAL)''')
+        
+        # Conversation history for batch processing
+        c.execute('''CREATE TABLE IF NOT EXISTS conversation_turns
+                     (id INTEGER PRIMARY KEY, user_id TEXT, role TEXT, 
+                      content TEXT, timestamp TEXT)''')
+        
+        conn.commit()
+        conn.close()
+    
+    def _get_embedding(self, text: str) -> np.ndarray:
+        """Mock embedding using hash-based approach (deterministic but meaningless - swap for real model)"""
+        # In production: use sentence-transformers or OpenAI embeddings
+        text = text.lower()
+        np.random.seed(int(hashlib.md5(text.encode()).hexdigest(), 16) % (2**32))
+        return np.random.randn(self.vector_store.dim).astype(np.float32)
+    
+
+    def _extract_explicit_commands(self, text: str) -> List[Dict]:
+        """Parse explicit memory commands from user input"""
+        # Order is important: handle more structured patterns first so we can
+        # prefer key:value style facts and avoid redundant entries.
+        patterns = [
+            (r"my (\w+) is (.+)", None),  # dynamic key:value (name: Hunter)
+            (r"remember that (.+)", "fact"),
+            (r"(?:don't forget|note that) (.+)", "fact"),
+            (r"i (?:work at|live in|prefer|hate|love|need) (.+)", "preference"),
+            (r"i'm (?:a|an) (.+)", "identity"),
+        ]
+
+        extracted: List[Dict] = []
+        seen_contents = set()
+
+        for pattern, mem_type in patterns:
+            matches = re.finditer(pattern, text, re.IGNORECASE)
+            for match in matches:
+                if pattern.startswith("my "):
+                    # Canonical key:value form, e.g. "name: Hunter"
+                    content = f"{match.group(1)}: {match.group(2)}"
+                elif mem_type:
+                    clause = match.group(1)
+                    # If a generic wrapper like "remember that ..." contains a
+                    # more structured "my X is Y" pattern, normalize that too.
+                    sub = re.match(r"my (\w+) is (.+)", clause, re.IGNORECASE)
+                    if sub:
+                        content = f"{sub.group(1)}: {sub.group(2)}"
+                    else:
+                        content = clause
+                else:
+                    # Fallback, though in practice only the first pattern uses mem_type=None.
+                    content = match.group(1)
+
+                content = content.strip()
+                if content in seen_contents:
+                    continue
+                seen_contents.add(content)
+
+                extracted.append({
+                    "type": mem_type or "fact",
+                    "content": content,
+                    "source": "user_command",
+                })
+        return extracted
+
+    def _extract_implicit_traits(self, user_id: str) -> List[Dict]:
+        """Analyze recent conversation for implicit patterns (simulated LLM extraction)"""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        
+        # Get last 10 user messages
+        c.execute('''SELECT content FROM conversation_turns 
+                     WHERE user_id = ? AND role = 'user' 
+                     ORDER BY timestamp DESC LIMIT 10''', (user_id,))
+        
+        recent_msgs = [row[0] for row in c.fetchall()]
+        conn.close()
+        
+        if len(recent_msgs) < 3:
+            return []
+        
+        # Simulated LLM extraction (replace with actual OpenAI/Anthropic call)
+        # In production: send recent_msgs to LLM with extraction prompt
+        text_combined = " ".join(recent_msgs).lower()
+        
+        traits = []
+        
+        # Simple rule-based extraction for MVP
+        indicators = {
+            "communication": {
+                "prefers_concise": len(" ".join(recent_msgs)) / len(recent_msgs) < 50,
+                "asks_detailed_questions": "?" in text_combined and ("how" in text_combined or "why" in text_combined),
+                "technical_terminology": any(w in text_combined for w in ["python", "code", "database", "api", "function"])
+            },
+            "technical": {
+                "python_user": "python" in text_combined,
+                "web_dev": any(w in text_combined for w in ["react", "javascript", "frontend", "backend"]),
+                "data_focus": any(w in text_combined for w in ["sql", "data", "analysis", "pandas"])
+            }
+        }
+        
+        for category, patterns in indicators.items():
+            for pattern, detected in patterns.items():
+                if detected:
+                    traits.append({
+                        "category": category,
+                        "pattern": pattern,
+                        "confidence": 0.7 + np.random.random() * 0.2  # Simulated confidence
+                    })
+        
+        return traits
+    
+    def store_interaction(self, user_id: str, role: str, content: str):
+        """Store conversation turn and trigger memory processing"""
+        timestamp = datetime.now().isoformat()
+        
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''INSERT INTO conversation_turns 
+                     (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)''',
+                  (user_id, role, content, timestamp))
+        conn.commit()
+        
+        # Extract explicit memories immediately
+        if role == "user":
+            explicit = self._extract_explicit_commands(content)
+            for mem in explicit:
+                self._store_explicit_memory(user_id, mem)
+            
+            # Batch implicit extraction every 5 messages
+            c.execute('''SELECT COUNT(*) FROM conversation_turns 
+                        WHERE user_id = ? AND role = 'user' ''', (user_id,))
+            count = c.fetchone()[0]
+            
+            if count % 5 == 0:
+                implicit = self._extract_implicit_traits(user_id)
+                for trait in implicit:
+                    self._store_implicit_memory(user_id, trait)
+        
+        conn.close()
+    
+    def _store_explicit_memory(self, user_id: str, memory: Dict):
+        """Store factual memory with vector embedding"""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        
+        # Check for existing *identical* memory so we don't duplicate exact rows,
+        # but allow multiple memories of the same type (e.g. multiple facts).
+        c.execute('''SELECT id FROM explicit_memories 
+                     WHERE user_id = ? AND memory_type = ? AND content = ?''',                   (user_id, memory["type"], memory["content"]))
+        
+        existing = c.fetchone()
+        if existing:
+            # Refresh timestamp / source on the existing row
+            c.execute('''UPDATE explicit_memories SET created_at = ?, source = ?
+                         WHERE id = ?''',                       (datetime.now().isoformat(), memory["source"], existing[0]))
+        else:
+            # Insert new
+            c.execute('''INSERT INTO explicit_memories 
+                         (user_id, memory_type, content, created_at, source)
+                         VALUES (?, ?, ?, ?, ?)''',                      (user_id, memory["type"], memory["content"], 
+                       datetime.now().isoformat(), memory["source"]))
+        
+        conn.commit()
+        conn.close()
+        
+        # Add to vector store for retrieval
+        emb = self._get_embedding(memory["content"])
+        mem_id = f"{user_id}_explicit_{hash(memory['content'])}"
+        self.vector_store.add(mem_id, memory["content"], 
+                            {"user_id": user_id, "type": "explicit"}, emb)
+    
+    def _store_implicit_memory(self, user_id: str, trait: Dict):
+        """Store inferred pattern with confidence scoring"""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        
+        # Check for existing similar pattern
+        c.execute('''SELECT id, confidence FROM implicit_memories 
+                     WHERE user_id = ? AND category = ? AND pattern = ?''',
+                  (user_id, trait["category"], trait["pattern"]))
+        
+        existing = c.fetchone()
+        if existing:
+            # Bayesian update of confidence
+            old_conf = existing[1]
+            new_conf = old_conf + (1 - old_conf) * trait["confidence"] * 0.3
+            c.execute('''UPDATE implicit_memories SET confidence = ?, last_observed = ?
+                         WHERE id = ?''', (new_conf, datetime.now().isoformat(), existing[0]))
+        else:
+            c.execute('''INSERT INTO implicit_memories 
+                         (user_id, category, pattern, confidence, last_observed, decay_factor)
+                         VALUES (?, ?, ?, ?, ?, ?)''',
+                      (user_id, trait["category"], trait["pattern"], 
+                       trait["confidence"], datetime.now().isoformat(), 0.95))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_context(self, user_id: str, current_query: str) -> Dict:
+        """Retrieve relevant memories for injection into prompt"""
+        query_emb = self._get_embedding(current_query)
+        
+        # 1. Explicit memories (semantic search)
+        explicit_results = self.vector_store.search(query_emb, user_id, top_k=3)
+        explicit_memories = []
+        for mem_id, score in explicit_results:
+            if score > 0.5:  # Similarity threshold
+                meta = self.vector_store.metadata[mem_id]
+                explicit_memories.append({
+                    "content": meta["text"],
+                    "relevance": score
+                })
+        
+        # 2. Implicit memories (with decay and filtering)
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''SELECT pattern, confidence, last_observed, decay_factor 
+                     FROM implicit_memories WHERE user_id = ?''', (user_id,))
+        
+        implicit_memories = []
+        now = datetime.now()
+        
+        for row in c.fetchall():
+            pattern, conf, last_obs, decay = row
+            last_dt = datetime.fromisoformat(last_obs)
+            days_old = (now - last_dt).days
+            
+            # Apply temporal decay
+            current_conf = conf * (decay ** days_old)
+            
+            if current_conf > 0.6:  # Threshold
+                # Check relevance to current query (simplified)
+                pattern_emb = self._get_embedding(pattern)
+                relevance = float(np.dot(query_emb / np.linalg.norm(query_emb), 
+                                       pattern_emb / np.linalg.norm(pattern_emb)))
+                
+                if relevance > 0.3 or current_conf > 0.8:  # High confidence bypasses relevance
+                    implicit_memories.append({
+                        "pattern": pattern,
+                        "confidence": current_conf,
+                        "category": row[0]  # You'd store category separately
+                    })
+        
+        conn.close()
+        
+        return {
+            "explicit_facts": explicit_memories,
+            "behavioral_patterns": sorted(implicit_memories, key=lambda x: x["confidence"], reverse=True)[:2],
+            "user_id": user_id
+        }
+    
+    def format_for_prompt(self, context: Dict) -> str:
+        """Format retrieved memories as text for LLM prompt"""
+        sections = []
+        
+        if context["explicit_facts"]:
+            facts_text = "\n".join([f"- {m['content']}" for m in context["explicit_facts"]])
+            sections.append(f"[Known Facts]\n{facts_text}")
+        
+        if context["behavioral_patterns"]:
+            patterns_text = "\n".join([f"- User tends to: {p['pattern']} (confidence: {p['confidence']:.2f})" 
+                                     for p in context["behavioral_patterns"]])
+            sections.append(f"[Observed Preferences]\n{patterns_text}")
+        
+        return "\n\n".join(sections) if sections else ""
+
+# Demo Usage
+def demo():
+    memory = HybridMemorySystem()
+    user_id = "user_123"
+    
+    print("=== Simulating Conversation ===\n")
+    
+    # Turn 1: Explicit memory
+    msg1 = "Remember that I work at OpenAI and I prefer concise technical answers."
+    print(f"User: {msg1}")
+    memory.store_interaction(user_id, "user", msg1)
+    
+    # Assistant response
+    memory.store_interaction(user_id, "assistant", "Noted. I'll keep my responses brief and technical.")
+    
+    # Turn 2-6: Build up history for implicit extraction
+    messages = [
+        "How do I optimize a Python function?",
+        "What's the time complexity of a hash map lookup?",
+        "Can you show me the code for a LRU cache?",
+        "I need to handle async database calls in Python",
+        "Write a decorator for timing functions"
+    ]
+    
+    for i, msg in enumerate(messages, 2):
+        print(f"User: {msg}")
+        memory.store_interaction(user_id, "user", msg)
+        memory.store_interaction(user_id, "assistant", f"Response {i}...")
+        print(f"  [Stored turn, implicit batch trigger: {i % 5 == 0}]")
+    
+    print("\n=== Retrieving Context ===\n")
+    
+    # Query the memory system
+    test_queries = [
+        "How should I structure my code?",
+        "Tell me about databases",
+        "What do I do for work?"
+    ]
+    
+    for query in test_queries:
+        print(f"Query: '{query}'")
+        context = memory.get_context(user_id, query)
+        prompt_addition = memory.format_for_prompt(context)
+        print(f"Injected Context:\n{prompt_addition}\n")
+        print("-" * 50)
+
+if __name__ == "__main__":
+    demo()

@@ -1,0 +1,15 @@
+[project]
+name = "ai-memory"
+version = "0.1.0"
+description = "Hybrid memory system CLI experiment"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.20",
+  "openai",
+  "python-dotenv",
+  "pytest",
+]
+
+[tool.uv]
+# Use a local .venv managed by uv

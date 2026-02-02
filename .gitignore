@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+
+# Virtual environment
+.venv/
+
+# Test/pytest cache
+.pytest_cache/
+
+# Local environment variables / secrets
+.env
+
+# Application databases (runtime data only)
+data/
+
+# Legacy SQLite databases in project root (from earlier runs)
+chat_memory.db
+chat_memory_*.db
+chat_memory_test.db
+chat_memory_kv_test.db
+
+# uv lockfile (can be regenerated from pyproject)
+uv.lock
