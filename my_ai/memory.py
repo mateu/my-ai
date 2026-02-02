@@ -208,37 +208,68 @@ class HybridMemorySystem:
         
         conn.close()
     
-    def _store_explicit_memory(self, user_id: str, memory: Dict):
-        """Store factual memory with vector embedding"""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
-        # Check for existing *identical* memory so we don't duplicate exact rows,
-        # but allow multiple memories of the same type (e.g. multiple facts).
-        c.execute('''SELECT id FROM explicit_memories 
-                     WHERE user_id = ? AND memory_type = ? AND content = ?''',                   (user_id, memory["type"], memory["content"]))
-        
-        existing = c.fetchone()
-        if existing:
-            # Refresh timestamp / source on the existing row
-            c.execute('''UPDATE explicit_memories SET created_at = ?, source = ?
-                         WHERE id = ?''',                       (datetime.now().isoformat(), memory["source"], existing[0]))
-        else:
-            # Insert new
-            c.execute('''INSERT INTO explicit_memories 
-                         (user_id, memory_type, content, created_at, source)
-                         VALUES (?, ?, ?, ?, ?)''',                      (user_id, memory["type"], memory["content"], 
-                       datetime.now().isoformat(), memory["source"]))
-        
-        conn.commit()
-        conn.close()
-        
-        # Add to vector store for retrieval
-        emb = self._get_embedding(memory["content"])
-        mem_id = f"{user_id}_explicit_{hash(memory['content'])}"
-        self.vector_store.add(mem_id, memory["content"], 
-                            {"user_id": user_id, "type": "explicit"}, emb)
     
+    def _store_explicit_memory(self, user_id: str, memory: Dict):
+            """Store factual memory with vector embedding.
+
+            We canonicalize simple "field: value" facts (e.g. "name: Hunter") and
+            ensure there is at most one explicit memory per (user, type, field). This
+            keeps the [Known Facts] block compact and reduces confusing duplicates.
+            """
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+
+            content = memory["content"].strip()
+            mem_type = memory["type"]
+
+            # If this looks like a canonical "field: value" fact, deduplicate on the
+            # field name so only the latest value is kept (e.g. only one "name: ...").
+            field_match = re.match(r"^(\w+):\s*(.+)$", content)
+            if field_match:
+                field = field_match.group(1).strip().lower()
+                # Remove any older facts for the same logical field for this user/type.
+                c.execute(
+                    "DELETE FROM explicit_memories "
+                    "WHERE user_id = ? AND memory_type = ? "
+                    "AND lower(substr(content, 1, instr(content, ':') - 1)) = ?",
+                    (user_id, mem_type, field),
+                )
+
+            # Check for existing *identical* memory so we don't duplicate exact rows,
+            # but allow multiple memories of the same type (e.g. multiple pets).
+            c.execute(
+                "SELECT id FROM explicit_memories "
+                "WHERE user_id = ? AND memory_type = ? AND content = ?",
+                (user_id, mem_type, content),
+            )
+
+            existing = c.fetchone()
+            if existing:
+                # Refresh timestamp / source on the existing row.
+                c.execute(
+                    "UPDATE explicit_memories SET created_at = ?, source = ? "
+                    "WHERE id = ?",
+                    (datetime.now().isoformat(), memory["source"], existing[0]),
+                )
+            else:
+                # Insert new.
+                c.execute(
+                    "INSERT INTO explicit_memories "
+                    "(user_id, memory_type, content, created_at, source) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (user_id, mem_type, content, datetime.now().isoformat(), memory["source"]),
+                )
+
+            conn.commit()
+            conn.close()
+
+            # Add to vector store for retrieval.
+            emb = self._get_embedding(content)
+            mem_id = f"{user_id}_explicit_{hash(content)}"
+            self.vector_store.add(mem_id, content, {"user_id": user_id, "type": "explicit"}, emb)
+
+
+
     def _store_implicit_memory(self, user_id: str, trait: Dict):
         """Store inferred pattern with confidence scoring"""
         conn = sqlite3.connect(self.db_path)
@@ -300,6 +331,29 @@ class HybridMemorySystem:
                     "content": content,
                     "relevance": 1.0,
                 })
+
+        # Consolidate explicit facts by logical field to avoid redundant variants.
+        consolidated: dict = {}
+        for mem in explicit_memories:
+            text = mem["content"]
+            m = re.match(r"^(\w+):\s*(.+)$", text)
+            if m:
+                field = m.group(1).strip().lower()
+                key = ("field", field)
+            else:
+                key = ("raw", text)
+
+            existing = consolidated.get(key)
+            if existing is None:
+                consolidated[key] = mem
+            else:
+                # Prefer the shorter, cleaner representation for the same logical fact.
+                if len(text) < len(existing["content"]):
+                    consolidated[key] = mem
+
+        explicit_memories = list(consolidated.values())
+
+
 
         # 2. Implicit memories (with decay and filtering)
         c.execute('''SELECT pattern, confidence, last_observed, decay_factor 
