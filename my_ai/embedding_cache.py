@@ -26,12 +26,13 @@ class EmbeddingCache:
         Args:
             db_path: Path to SQLite database file. If None, uses
                     EMBEDDING_CACHE_DB env var or defaults to
-                    'data/embeddings_cache.db'.
+                    'data/embeddings_cache.db'. The parent directory
+                    will be created if it doesn't exist.
         """
         if db_path is None:
             db_path = os.getenv("EMBEDDING_CACHE_DB", "data/embeddings_cache.db")
 
-        # Ensure directory exists
+        # Ensure directory exists (handles both absolute and relative paths)
         if not os.path.isabs(db_path):
             db_dir = os.path.dirname(db_path)
             if db_dir:

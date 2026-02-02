@@ -287,7 +287,8 @@ class HybridMemorySystem:
         structures) without bloating _extract_explicit_commands.
         """
         # Pattern-specific handling for "my X is Y" which we treat as key:value.
-        if pattern == _MY_X_IS_Y_PATTERN:
+        # Check if this is the "my X is Y" pattern (first in _EXPLICIT_PATTERNS)
+        if pattern is _EXPLICIT_PATTERNS[0][0]:
             return [f"{match.group(1)}: {match.group(2)}"]
 
         if mem_type:
