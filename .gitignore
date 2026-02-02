@@ -13,6 +13,9 @@ __pycache__/
 # Application databases (runtime data only)
 data/
 
+# Chroma vector database (runtime data only)
+chroma_db/
+
 # Legacy SQLite databases in project root (from earlier runs)
 chat_memory.db
 chat_memory_*.db
