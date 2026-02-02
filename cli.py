@@ -110,7 +110,7 @@ You may still use general world knowledge for non-user-specific questions.
 def interactive_chat():
     """Run an interactive chat session with memory"""
     print("🧠 Hybrid Memory System - Interactive Mode")
-    print("Commands: /quit, /memories, /forget <text>, /save, /load <file>")
+    print("Commands: /help for a list of commands")
     print("-" * 50)
 
     # Ensure database directory exists
@@ -143,6 +143,17 @@ def interactive_chat():
                 continue
 
             # Handle commands
+            if user_input.lower() in {"/help", "help", "?", "/?"}:
+                print("\nAvailable commands:")
+                print("  /help            Show this help message")
+                print("  /quit            Save the current session and exit")
+                print("  /memories        Show explicit memories and implicit patterns for this user")
+                print("  /forget <text>   Forget explicit memories whose content contains <text>")
+                print("  /save            Snapshot the current memory DB to data/chat_memory_YYYYMMDD_HHMMSS.db")
+                print("  /load <file>     Load a saved DB file into the active session")
+                print("  (Anything else)  Is treated as a normal message to the assistant")
+                continue
+
             if user_input.lower() == "/quit":
                 print("Saving session...")
                 break
