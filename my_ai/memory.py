@@ -7,32 +7,138 @@ from datetime import datetime, timedelta
 import re
 import hashlib
 
+# Precompiled regex patterns for performance
+_EXPLICIT_PATTERNS = [
+    (re.compile(r"my (\w+) is (.+)", re.IGNORECASE), None),
+    (re.compile(r"remember that (.+)", re.IGNORECASE), "fact"),
+    (re.compile(r"remember (?!that\b)(.+)", re.IGNORECASE), "fact"),
+    (re.compile(r"(?:don't forget|note that) (.+)", re.IGNORECASE), "fact"),
+    (re.compile(r"i have (.+)", re.IGNORECASE), "fact"),
+    (re.compile(r"i (?:work at|live in|prefer|hate|love|need) (.+)", re.IGNORECASE), "preference"),
+    (re.compile(r"i'm (?:a|an) (.+)", re.IGNORECASE), "identity"),
+]
+
+_FIELD_VALUE_PATTERN = re.compile(r"^(\w+):\s*(.+)$")
+_MY_X_IS_Y_PATTERN = re.compile(r"my (\w+) is (.+)", re.IGNORECASE)
+_DOGS_PATTERN_1 = re.compile(r"i have two dogs: one named ([^,]+),?\s*and the other(?: is)? named ([^,]+)", re.IGNORECASE)
+_DOGS_PATTERN_2 = re.compile(r"two dogs: one named ([^,]+),?\s*and the other(?: is)? named ([^,]+)", re.IGNORECASE)
+_MULTI_ENTITY_1 = re.compile(r"i have\s+(\w+)\s+(\w+)s\s+named\s+([^,]+),?\s*(?:and|, and)\s*([^,]+)", re.IGNORECASE)
+_MULTI_ENTITY_2 = re.compile(r"(\w+)\s+(\w+)s\s+named\s+([^,]+),?\s*(?:and|, and)\s*([^,]+)", re.IGNORECASE)
+
+
 class VectorStore:
-    """Simple in-memory vector store using numpy (replace with Chroma/Pinecone in prod)"""
-    def __init__(self, dim: int = 384):  # all-MiniLM-L6-v2 dimension
-        self.dim = dim
-        self.vectors: Dict[str, np.ndarray] = {}  # id -> vector
-        self.metadata: Dict[str, dict] = {}       # id -> metadata
+    """Numpy-matrix-backed vector store with vectorized search."""
+    
+    def __init__(self, dim: int = 384):
+        """Initialize vector store.
+        
+        Args:
+            dim: Embedding dimension (default 384 for all-MiniLM-L6-v2)
+        """
+        self.embedding_dim = dim  # Use embedding_dim naming from PR #4
+        self.vectors = np.empty((0, dim), dtype=np.float32)  # Contiguous N x D matrix
+        self.ids: List[str] = []  # Parallel to matrix rows
+        self.metadata: List[dict] = []  # Parallel to matrix rows
+        self.id_to_index: Dict[str, int] = {}  # Fast lookup
         
     def add(self, id: str, text: str, metadata: dict, embedding: np.ndarray):
-        self.vectors[id] = embedding / np.linalg.norm(embedding)  # normalize
-        self.metadata[id] = {**metadata, "text": text}
+        """Add or update a vector in the store.
+        
+        Args:
+            id: Unique identifier
+            text: Text content
+            metadata: Associated metadata dict
+            embedding: Numpy array of any dimension (will be padded/trimmed to embedding_dim)
+        """
+        # Auto-pad or trim to embedding_dim for robustness
+        emb = np.array(embedding, dtype=np.float32)
+        if emb.shape[0] != self.embedding_dim:
+            if emb.shape[0] > self.embedding_dim:
+                emb = emb[:self.embedding_dim]
+            else:
+                pad = self.embedding_dim - emb.shape[0]
+                emb = np.pad(emb, (0, pad), mode='constant')
+        
+        # Normalize to unit length
+        norm = np.linalg.norm(emb)
+        if norm > 0:
+            emb = emb / norm
+        
+        # Update existing entry or add new one
+        if id in self.id_to_index:
+            idx = self.id_to_index[id]
+            self.vectors[idx] = emb
+            self.metadata[idx] = {**metadata, "text": text}
+        else:
+            # Add new entry
+            idx = len(self.ids)
+            self.ids.append(id)
+            self.metadata.append({**metadata, "text": text})
+            self.id_to_index[id] = idx
+            # Append to vectors matrix
+            self.vectors = np.vstack([self.vectors, emb.reshape(1, -1)])
     
     def search(self, query_emb: np.ndarray, user_id: str, top_k: int = 3) -> List[Tuple[str, float]]:
-        """Return top_k matches filtered by user_id"""
-        query_norm = query_emb / np.linalg.norm(query_emb)
-        results = []
+        """Search for top-k most similar vectors.
         
-        for id, vec in self.vectors.items():
-            meta = self.metadata[id]
-            if meta.get("user_id") != user_id:
-                continue
-            # Cosine similarity
-            score = float(np.dot(query_norm, vec))
-            results.append((id, score))
+        Uses vectorized BLAS-backed matrix multiplication for efficiency.
+        
+        Args:
+            query_emb: Query embedding
+            user_id: Filter results to this user
+            top_k: Number of results to return
             
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
+        Returns:
+            List of (id, score) tuples sorted by score (descending)
+        """
+        # Handle empty store
+        if len(self.ids) == 0:
+            return []
+        
+        # Normalize query
+        query = np.array(query_emb, dtype=np.float32)
+        if query.shape[0] != self.embedding_dim:
+            if query.shape[0] > self.embedding_dim:
+                query = query[:self.embedding_dim]
+            else:
+                pad = self.embedding_dim - query.shape[0]
+                query = np.pad(query, (0, pad), mode='constant')
+        
+        norm = np.linalg.norm(query)
+        if norm > 0:
+            query = query / norm
+        
+        # Single BLAS-backed matrix.dot(query) for all similarities
+        scores = self.vectors.dot(query)
+        
+        # Create boolean mask for user_id filtering
+        user_mask = np.array([meta.get("user_id") == user_id for meta in self.metadata], dtype=bool)
+        
+        # Apply mask: set non-matching users to -inf
+        masked_scores = np.where(user_mask, scores, -np.inf)
+        
+        # Check if we have any valid matches
+        if not np.any(user_mask):
+            return []
+        
+        # Use argpartition + argsort for efficient O(n) top-k selection
+        # Get indices of top_k elements
+        k = min(top_k, np.sum(user_mask))
+        if k == 0:
+            return []
+        
+        # argpartition is O(n) for finding top k
+        top_k_indices = np.argpartition(masked_scores, -k)[-k:]
+        # Sort just the top k by score (descending)
+        top_k_indices = top_k_indices[np.argsort(masked_scores[top_k_indices])[::-1]]
+        
+        # Build results
+        results = []
+        for idx in top_k_indices:
+            if masked_scores[idx] > -np.inf:  # Valid match
+                results.append((self.ids[idx], float(masked_scores[idx])))
+        
+        return results
 
 class HybridMemorySystem:
     def __init__(self, db_path: str | None = None):
@@ -55,9 +161,14 @@ class HybridMemorySystem:
         self._init_db()
         
     def _init_db(self):
-        """Initialize SQLite tables"""
+        """Initialize SQLite tables with performance tuning."""
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
+        
+        # Enable WAL mode for better concurrency
+        c.execute('PRAGMA journal_mode = WAL')
+        # Use NORMAL synchronous for better performance (still safe with WAL)
+        c.execute('PRAGMA synchronous = NORMAL')
         
         # Explicit memories
         c.execute('''CREATE TABLE IF NOT EXISTS explicit_memories
@@ -75,6 +186,14 @@ class HybridMemorySystem:
                      (id INTEGER PRIMARY KEY, user_id TEXT, role TEXT, 
                       content TEXT, timestamp TEXT)''')
         
+        # Create indexes for performance (idempotent)
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_conversation_user_ts 
+                     ON conversation_turns(user_id, timestamp DESC)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_implicit_user 
+                     ON implicit_memories(user_id)''')
+        c.execute('''CREATE INDEX IF NOT EXISTS idx_explicit_user 
+                     ON explicit_memories(user_id)''')
+        
         conn.commit()
         conn.close()
     
@@ -83,25 +202,34 @@ class HybridMemorySystem:
 
         By default we use a mock, hash-based embedding so tests and offline runs
         do not depend on a real model. If AI_EMBEDDING_BACKEND="ollama" is set,
-        we call an Ollama embedding model instead (e.g. nomic-embed-text).
+        we call an Ollama embedding model instead (e.g. qwen3-embedding:0.6b).
         """
         backend = os.getenv("AI_EMBEDDING_BACKEND", "mock").lower()
 
         # Fast, deterministic mock for tests and simple local runs.
+        # Mock backend is NOT cached as it's already deterministic via hash seed.
         if backend == "mock":
             text_norm = text.lower()
             np.random.seed(int(hashlib.md5(text_norm.encode()).hexdigest(), 16) % (2**32))
-            return np.random.randn(self.vector_store.dim).astype(np.float32)
+            return np.random.randn(self.vector_store.embedding_dim).astype(np.float32)
 
         if backend == "ollama":
             import requests
+            from .embedding_cache import get_embedding_cache
 
             # Allow overriding the embedding model and URL via environment.
-            # Default to a general-purpose text embedding model.
-            model = os.getenv("OLLAMA_EMBED_MODEL", os.getenv("AI_EMBED_MODEL", "nomic-embed-text:latest"))
+            # Default to qwen3-embedding:0.6b for better efficiency
+            model = os.getenv("OLLAMA_EMBED_MODEL", os.getenv("AI_EMBED_MODEL", "qwen3-embedding:0.6b"))
             base_url = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
             url = f"{base_url}/api/embed"
 
+            # Check persistent cache BEFORE making API call
+            cache = get_embedding_cache()
+            cached = cache.get(model, text)
+            if cached is not None:
+                return cached
+
+            # Also check in-memory cache (for backwards compatibility during transition)
             cache_key = (backend, model, text)
             if cache_key in self.embeddings_cache:
                 return self.embeddings_cache[cache_key]
@@ -127,28 +255,31 @@ class HybridMemorySystem:
 
                 vec = np.array(emb, dtype=np.float32)
                 # Optionally pad/trim to our VectorStore dim to keep interfaces simple.
-                if vec.shape[0] != self.vector_store.dim:
-                    if vec.shape[0] > self.vector_store.dim:
-                        vec = vec[: self.vector_store.dim]
+                if vec.shape[0] != self.vector_store.embedding_dim:
+                    if vec.shape[0] > self.vector_store.embedding_dim:
+                        vec = vec[: self.vector_store.embedding_dim]
                     else:
-                        pad = self.vector_store.dim - vec.shape[0]
+                        pad = self.vector_store.embedding_dim - vec.shape[0]
                         vec = np.pad(vec, (0, pad))
 
+                # Store in both caches
                 self.embeddings_cache[cache_key] = vec
+                cache.set(model, text, vec)
+                
                 return vec
             except Exception:
                 # Fall back to mock embedding if Ollama is unavailable or misconfigured.
                 text_norm = text.lower()
                 np.random.seed(int(hashlib.md5(text_norm.encode()).hexdigest(), 16) % (2**32))
-                return np.random.randn(self.vector_store.dim).astype(np.float32)
+                return np.random.randn(self.vector_store.embedding_dim).astype(np.float32)
 
         # Unknown backend: fall back to mock.
         text_norm = text.lower()
         np.random.seed(int(hashlib.md5(text_norm.encode()).hexdigest(), 16) % (2**32))
-        return np.random.randn(self.vector_store.dim).astype(np.float32)
+        return np.random.randn(self.vector_store.embedding_dim).astype(np.float32)
     
 
-    def _normalize_explicit_match(self, pattern: str, mem_type: str | None, match: re.Match) -> list[str]:
+    def _normalize_explicit_match(self, pattern: re.Pattern, mem_type: str | None, match: re.Match) -> list[str]:
         """Normalize a single regex match into one or more canonical fact strings.
 
         Today we always return a single fact string, but this helper gives us a
@@ -156,33 +287,22 @@ class HybridMemorySystem:
         structures) without bloating _extract_explicit_commands.
         """
         # Pattern-specific handling for "my X is Y" which we treat as key:value.
-        if pattern.startswith("my "):
+        # Check if this is the "my X is Y" pattern (first in _EXPLICIT_PATTERNS)
+        if pattern is _EXPLICIT_PATTERNS[0][0]:
             return [f"{match.group(1)}: {match.group(2)}"]
 
         if mem_type:
             clause = match.group(1)
             # If a generic wrapper like "remember that ..." contains a more
             # structured "my X is Y" pattern, normalize that too.
-            sub = re.match(r"my (\w+) is (.+)", clause, re.IGNORECASE)
+            sub = _MY_X_IS_Y_PATTERN.match(clause)
             if sub:
                 return [f"{sub.group(1)}: {sub.group(2)}"]
 
             # Special-case normalization for common multi-value patterns,
             # e.g. "I have two dogs: one named Enola, and the other named Glacier"
             # or "I have two cats named Barcelona and Jesus".
-            dogs_pattern_1 = re.match(
-                r"i have two dogs: one named ([^,]+),?\s*and the other(?: is)? named ([^,]+)",
-                clause,
-                re.IGNORECASE,
-            )
-            dogs_pattern_2 = None
-            if not dogs_pattern_1:
-                dogs_pattern_2 = re.match(
-                    r"two dogs: one named ([^,]+),?\s*and the other(?: is)? named ([^,]+)",
-                    clause,
-                    re.IGNORECASE,
-                )
-            dogs_match = dogs_pattern_1 or dogs_pattern_2
+            dogs_match = _DOGS_PATTERN_1.match(clause) or _DOGS_PATTERN_2.match(clause)
             if dogs_match:
                 first = dogs_match.group(1).strip()
                 second = dogs_match.group(2).strip()
@@ -191,19 +311,7 @@ class HybridMemorySystem:
             # Generic multi-entity pattern: "I have two cats named A and B" or
             # "two cats named A and B". We canonicalize as "cats: A, B" so that
             # downstream code can treat it like any other field:value fact.
-            multi_1 = re.match(
-                r"i have\s+(\w+)\s+(\w+)s\s+named\s+([^,]+),?\s*(?:and|, and)\s*([^,]+)",
-                clause,
-                re.IGNORECASE,
-            )
-            multi_2 = None
-            if not multi_1:
-                multi_2 = re.match(
-                    r"(\w+)\s+(\w+)s\s+named\s+([^,]+),?\s*(?:and|, and)\s*([^,]+)",
-                    clause,
-                    re.IGNORECASE,
-                )
-            multi = multi_1 or multi_2
+            multi = _MULTI_ENTITY_1.match(clause) or _MULTI_ENTITY_2.match(clause)
             if multi:
                 _, type_word, first, second = multi.groups()
                 field = type_word.rstrip('s').lower() + 's'
@@ -227,21 +335,12 @@ class HybridMemorySystem:
         """Parse explicit memory commands from user input"""
         # Order is important: handle more structured patterns first so we can
         # prefer key:value style facts and avoid redundant entries.
-        patterns = [
-            (r"my (\w+) is (.+)", None),  # dynamic key:value (name: Hunter)
-            (r"remember that (.+)", "fact"),
-            (r"remember (?!that\b)(.+)", "fact"),
-            (r"(?:don't forget|note that) (.+)", "fact"),
-            (r"i have (.+)", "fact"),
-            (r"i (?:work at|live in|prefer|hate|love|need) (.+)", "preference"),
-            (r"i'm (?:a|an) (.+)", "identity"),
-        ]
-
+        # Use precompiled patterns for performance
         extracted: List[Dict] = []
         seen_contents = set()
 
-        for pattern, mem_type in patterns:
-            matches = re.finditer(pattern, text, re.IGNORECASE)
+        for pattern, mem_type in _EXPLICIT_PATTERNS:
+            matches = pattern.finditer(text)
             for match in matches:
                 contents = self._normalize_explicit_match(pattern, mem_type, match)
                 for content in contents:
@@ -305,129 +404,146 @@ class HybridMemorySystem:
         return traits
     
     def store_interaction(self, user_id: str, role: str, content: str):
-        """Store conversation turn and trigger memory processing"""
+        """Store conversation turn and trigger memory processing with single transaction."""
         timestamp = datetime.now().isoformat()
         
         conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        c.execute('''INSERT INTO conversation_turns 
-                     (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)''',
-                  (user_id, role, content, timestamp))
-        conn.commit()
-        
-        # Extract explicit memories immediately
-        if role == "user":
-            explicit = self._extract_explicit_commands(content)
-            for mem in explicit:
-                self._store_explicit_memory(user_id, mem)
+        try:
+            c = conn.cursor()
             
-            # Batch implicit extraction every 5 messages
-            c.execute('''SELECT COUNT(*) FROM conversation_turns 
-                        WHERE user_id = ? AND role = 'user' ''', (user_id,))
-            count = c.fetchone()[0]
+            # Insert conversation turn
+            c.execute('''INSERT INTO conversation_turns 
+                         (user_id, role, content, timestamp) VALUES (?, ?, ?, ?)''',
+                      (user_id, role, content, timestamp))
             
-            if count % 5 == 0:
-                implicit = self._extract_implicit_traits(user_id)
-                for trait in implicit:
-                    self._store_implicit_memory(user_id, trait)
+            # Extract explicit memories immediately
+            if role == "user":
+                explicit = self._extract_explicit_commands(content)
+                for mem in explicit:
+                    self._store_explicit_memory_transactional(c, user_id, mem)
+                
+                # Batch implicit extraction every 5 messages
+                c.execute('''SELECT COUNT(*) FROM conversation_turns 
+                            WHERE user_id = ? AND role = 'user' ''', (user_id,))
+                count = c.fetchone()[0]
+                
+                if count % 5 == 0:
+                    implicit = self._extract_implicit_traits(user_id)
+                    for trait in implicit:
+                        self._store_implicit_memory_transactional(c, user_id, trait)
+            
+            # Single commit for all operations
+            conn.commit()
+        finally:
+            conn.close()
+    
+    def _store_explicit_memory_transactional(self, cursor, user_id: str, memory: Dict):
+        """Store factual memory using provided cursor (for transaction batching).
         
-        conn.close()
+        We canonicalize simple "field: value" facts (e.g. "name: Hunter") and
+        ensure there is at most one explicit memory per (user, type, field). This
+        keeps the [Known Facts] block compact and reduces confusing duplicates.
+        """
+        content = memory["content"].strip()
+        mem_type = memory["type"]
+
+        # If this looks like a canonical "field: value" fact, deduplicate on the
+        # field name so only the latest value is kept (e.g. only one "name: ...").
+        field_match = _FIELD_VALUE_PATTERN.match(content)
+        if field_match:
+            field = field_match.group(1).strip().lower()
+            # Remove any older facts for the same logical field for this user/type.
+            cursor.execute(
+                "DELETE FROM explicit_memories "
+                "WHERE user_id = ? AND memory_type = ? "
+                "AND lower(substr(content, 1, instr(content, ':') - 1)) = ?",
+                (user_id, mem_type, field),
+            )
+
+        # Check for existing *identical* memory so we don't duplicate exact rows,
+        # but allow multiple memories of the same type (e.g. multiple pets).
+        cursor.execute(
+            "SELECT id FROM explicit_memories "
+            "WHERE user_id = ? AND memory_type = ? AND content = ?",
+            (user_id, mem_type, content),
+        )
+
+        existing = cursor.fetchone()
+        if existing:
+            # If we already have the canonical fact for this field, skip storing
+            # a redundant non-canonical variant of the same underlying fact.
+            if field_match is not None:
+                return
+
+            # Otherwise, refresh timestamp / source on the existing row.
+            cursor.execute(
+                "UPDATE explicit_memories SET created_at = ?, source = ? "
+                "WHERE id = ?",
+                (datetime.now().isoformat(), memory["source"], existing[0]),
+            )
+        else:
+            # Insert new.
+            cursor.execute(
+                "INSERT INTO explicit_memories "
+                "(user_id, memory_type, content, created_at, source) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (user_id, mem_type, content, datetime.now().isoformat(), memory["source"]),
+            )
+
+        # Add to vector store for retrieval.
+        emb = self._get_embedding(content)
+        mem_id = f"{user_id}_explicit_{hash(content)}"
+        self.vector_store.add(mem_id, content, {"user_id": user_id, "type": "explicit"}, emb)
     
     
     def _store_explicit_memory(self, user_id: str, memory: Dict):
-            """Store factual memory with vector embedding.
-
-            We canonicalize simple "field: value" facts (e.g. "name: Hunter") and
-            ensure there is at most one explicit memory per (user, type, field). This
-            keeps the [Known Facts] block compact and reduces confusing duplicates.
-            """
-            conn = sqlite3.connect(self.db_path)
+        """Store factual memory with vector embedding.
+        
+        Wrapper for backwards compatibility - creates its own transaction.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
             c = conn.cursor()
-
-            content = memory["content"].strip()
-            mem_type = memory["type"]
-
-            # If this looks like a canonical "field: value" fact, deduplicate on the
-            # field name so only the latest value is kept (e.g. only one "name: ...").
-            field_match = re.match(r"^(\w+):\s*(.+)$", content)
-            if field_match:
-                field = field_match.group(1).strip().lower()
-                # Remove any older facts for the same logical field for this user/type.
-                c.execute(
-                    "DELETE FROM explicit_memories "
-                    "WHERE user_id = ? AND memory_type = ? "
-                    "AND lower(substr(content, 1, instr(content, ':') - 1)) = ?",
-                    (user_id, mem_type, field),
-                )
-
-            # Check for existing *identical* memory so we don't duplicate exact rows,
-            # but allow multiple memories of the same type (e.g. multiple pets).
-            c.execute(
-                "SELECT id FROM explicit_memories "
-                "WHERE user_id = ? AND memory_type = ? AND content = ?",
-                (user_id, mem_type, content),
-            )
-
-            existing = c.fetchone()
-            if existing:
-                # If we already have the canonical fact for this field, skip storing
-                # a redundant non-canonical variant of the same underlying fact.
-                if field_match is not None:
-                    conn.commit()
-                    conn.close()
-                    return
-
-                # Otherwise, refresh timestamp / source on the existing row.
-                c.execute(
-                    "UPDATE explicit_memories SET created_at = ?, source = ? "
-                    "WHERE id = ?",
-                    (datetime.now().isoformat(), memory["source"], existing[0]),
-                )
-            else:
-                # Insert new.
-                c.execute(
-                    "INSERT INTO explicit_memories "
-                    "(user_id, memory_type, content, created_at, source) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (user_id, mem_type, content, datetime.now().isoformat(), memory["source"]),
-                )
-
+            self._store_explicit_memory_transactional(c, user_id, memory)
             conn.commit()
+        finally:
             conn.close()
 
-            # Add to vector store for retrieval.
-            emb = self._get_embedding(content)
-            mem_id = f"{user_id}_explicit_{hash(content)}"
-            self.vector_store.add(mem_id, content, {"user_id": user_id, "type": "explicit"}, emb)
 
-
-
-    def _store_implicit_memory(self, user_id: str, trait: Dict):
-        """Store inferred pattern with confidence scoring"""
-        conn = sqlite3.connect(self.db_path)
-        c = conn.cursor()
-        
+    def _store_implicit_memory_transactional(self, cursor, user_id: str, trait: Dict):
+        """Store inferred pattern with confidence scoring using provided cursor."""
         # Check for existing similar pattern
-        c.execute('''SELECT id, confidence FROM implicit_memories 
+        cursor.execute('''SELECT id, confidence FROM implicit_memories 
                      WHERE user_id = ? AND category = ? AND pattern = ?''',
                   (user_id, trait["category"], trait["pattern"]))
         
-        existing = c.fetchone()
+        existing = cursor.fetchone()
         if existing:
             # Bayesian update of confidence
             old_conf = existing[1]
             new_conf = old_conf + (1 - old_conf) * trait["confidence"] * 0.3
-            c.execute('''UPDATE implicit_memories SET confidence = ?, last_observed = ?
+            cursor.execute('''UPDATE implicit_memories SET confidence = ?, last_observed = ?
                          WHERE id = ?''', (new_conf, datetime.now().isoformat(), existing[0]))
         else:
-            c.execute('''INSERT INTO implicit_memories 
+            cursor.execute('''INSERT INTO implicit_memories 
                          (user_id, category, pattern, confidence, last_observed, decay_factor)
                          VALUES (?, ?, ?, ?, ?, ?)''',
                       (user_id, trait["category"], trait["pattern"], 
                        trait["confidence"], datetime.now().isoformat(), 0.95))
+
+
+    def _store_implicit_memory(self, user_id: str, trait: Dict):
+        """Store inferred pattern with confidence scoring.
         
-        conn.commit()
-        conn.close()
+        Wrapper for backwards compatibility - creates its own transaction.
+        """
+        conn = sqlite3.connect(self.db_path)
+        try:
+            c = conn.cursor()
+            self._store_implicit_memory_transactional(c, user_id, trait)
+            conn.commit()
+        finally:
+            conn.close()
     
     def get_context(self, user_id: str, current_query: str) -> Dict:
         """Retrieve relevant memories for injection into prompt"""
@@ -438,11 +554,14 @@ class HybridMemorySystem:
         explicit_memories = []
         for mem_id, score in explicit_results:
             if score > 0.0:  # Similarity threshold (lowered for mock embedding)
-                meta = self.vector_store.metadata[mem_id]
-                explicit_memories.append({
-                    "content": meta["text"],
-                    "relevance": score
-                })
+                # Use id_to_index for metadata access with new VectorStore API
+                idx = self.vector_store.id_to_index.get(mem_id)
+                if idx is not None:
+                    meta = self.vector_store.metadata[idx]
+                    explicit_memories.append({
+                        "content": meta["text"],
+                        "relevance": score
+                    })
         
         # Fallback: if nothing surfaced via the vector store (e.g., in tests or
         # with the mock embedding), include the most recent explicit memories
