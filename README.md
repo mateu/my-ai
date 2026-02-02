@@ -155,6 +155,60 @@ make shell
 
 You can explore or extend the memory behavior by editing `ai_memory_system.py` and adjusting the patterns or scoring logic for explicit and implicit memories.
 
+## Optional: Chroma Vector Backend
+
+By default, the system uses an in-memory vector store that resets on each run. For persistent vector storage, you can optionally use [ChromaDB](https://www.trychroma.com/).
+
+### Enabling Chroma
+
+1. **Install the Chroma dependency** using uv:
+
+   ```bash
+   uv sync --extras chroma
+   ```
+
+   Or if you prefer pip directly:
+
+   ```bash
+   pip install -e '.[chroma]'
+   ```
+
+2. **Set the environment variable** to enable Chroma:
+
+   ```bash
+   export VECTOR_DB=chroma
+   ```
+
+   Optionally, customize the storage location (default is `./chroma_db`):
+
+   ```bash
+   export CHROMA_PERSIST_DIR=/path/to/chroma/storage
+   ```
+
+3. **Run the CLI** as usual:
+
+   ```bash
+   uv run cli.py
+   ```
+
+   The system will now use ChromaDB for persistent vector storage.
+
+### Migrating Existing Memories to Chroma
+
+If you have existing explicit memories in your SQLite database and want to migrate them to Chroma:
+
+```bash
+VECTOR_DB=chroma python scripts/migrate_to_chroma.py
+```
+
+This will:
+- Load all explicit memories from `data/chat_memory.db` (or specify a custom path with `--db-path`)
+- Generate embeddings for each memory
+- Insert them into the Chroma collection
+- Persist the collection to disk
+
+**Note:** The migration script uses the same embedding function as the main system, so memories will be properly indexed for semantic search.
+
 ## Testing
 
 Tests live under the standard `tests/` directory. Run them with:

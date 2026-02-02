@@ -12,5 +12,10 @@ dependencies = [
   "pytest",
 ]
 
+[project.optional-dependencies]
+chroma = [
+  "chromadb>=0.4.0",
+]
+
 [tool.uv]
 # Use a local .venv managed by uv

@@ -46,7 +46,21 @@ class HybridMemorySystem:
                 os.makedirs(db_dir, exist_ok=True)
 
         self.db_path = db_path
-        self.vector_store = VectorStore()
+        
+        # Initialize vector store based on VECTOR_DB environment variable
+        vector_db = os.getenv("VECTOR_DB", "").lower()
+        if vector_db == "chroma":
+            try:
+                from my_ai.vector_backends.chroma_adapter import ChromaAdapter
+                persist_dir = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+                self.vector_store = ChromaAdapter(dim=384, persist_dir=persist_dir)
+            except (ImportError, Exception):
+                # Fall back to in-memory VectorStore if chromadb not installed
+                # or initialization fails
+                self.vector_store = VectorStore()
+        else:
+            self.vector_store = VectorStore()
+        
         self.embeddings_cache = {}  # Simple embedding cache
         
         # Mock embedding function (replace with real model)
@@ -397,9 +411,10 @@ class HybridMemorySystem:
 
             # Add to vector store for retrieval.
             emb = self._get_embedding(content)
-            mem_id = f"{user_id}_explicit_{hash(content)}"
+            # Use deterministic hash for consistent IDs across runs
+            content_hash = hashlib.md5(content.encode('utf-8')).hexdigest()[:16]
+            mem_id = f"{user_id}_explicit_{content_hash}"
             self.vector_store.add(mem_id, content, {"user_id": user_id, "type": "explicit"}, emb)
-
 
 
     def _store_implicit_memory(self, user_id: str, trait: Dict):
