@@ -16,6 +16,11 @@ data/
 # Chroma vector database (runtime data only)
 chroma_db/
 
+# Python package metadata
+*.egg-info/
+dist/
+build/
+
 # Legacy SQLite databases in project root (from earlier runs)
 chat_memory.db
 chat_memory_*.db
