@@ -1,0 +1,38 @@
+%%{init: {"theme":"base","themeVariables":{"fontSize":"24px","edgeLabelBackground":"#ffffff","lineColor":"#333333","primaryTextColor":"#111111","primaryColor":"#f3f4f6","secondaryColor":"#e5e7eb","tertiaryColor":"#ffffff"},"flowchart":{"nodeSpacing":80,"rankSpacing":100}}}%%
+flowchart TD
+  U["User message"] --> S["store_interaction()"]
+  S --> DB1["Insert conversation_turns (SQLite)"]
+
+  %% Explicit extraction
+  S --> E["Extract explicit facts\n_extract_explicit_commands()"]
+  E --> LLM["LLM extraction (Ollama)\n_or regex fallback (offline/mock)"]
+  LLM --> EX["Explicit facts: key: value"]
+  EX --> DEDUPE["Field-level dedupe + insert\n_store_explicit_memory_transactional()"]
+  DEDUPE --> DB2["explicit_memories (SQLite)"]
+  DEDUPE --> VEC["Embed + add to VectorStore"]
+
+  %% Implicit extraction
+  S -->|every 5 user msgs| IM["Extract implicit traits\n_extract_implicit_traits()"]
+  IM --> RULES["Rule-based detection\n(communication / technical)"]
+  RULES --> DB3["implicit_memories (SQLite)"]
+
+  %% Retrieval path
+  Q["New user query"] --> EMB["Embed query\n_get_embedding()"]
+  EMB --> VECSEARCH["VectorStore.search(top_k=3)"]
+  VECSEARCH -->|hits| EX1["Explicit facts (semantic)"]
+
+  EMB --> RECENT["Fetch 5 most recent explicit facts (SQLite)"]
+  RECENT --> EX2["Explicit facts (recency fallback)"]
+
+  EX1 --> CONSOL["Consolidate by field\n(shorter variant wins)"]
+  EX2 --> CONSOL
+  CONSOL --> EXF["explicit_facts"]
+
+  EMB --> IMPL["Load implicit_memories (SQLite)"]
+  IMPL --> DECAY["Apply time decay + threshold"]
+  DECAY --> REL["Relevance check vs query\nor high-confidence bypass"]
+  REL --> IMPF["behavioral_patterns (top 2)"]
+
+  EXF --> CTX["Context bundle"]
+  IMPF --> CTX
+  CTX --> PROMPT["format_for_prompt()"]
