@@ -12,6 +12,7 @@ from typing import List, Dict, Tuple
 from datetime import datetime
 import re
 import hashlib
+import shlex
 
 # Load API key from .env file (create this file with: OPENAI_API_KEY=your_key_here)
 load_dotenv()
@@ -107,6 +108,142 @@ You may still use general world knowledge for non-user-specific questions.
     except Exception as e:
         return f"Error calling LLM: {str(e)}"
 
+def _extract_message_text(message: Dict) -> str:
+    text = (message.get("text") or "").strip()
+    if text:
+        return text
+
+    content = message.get("content") or []
+    parts = []
+    for item in content:
+        if item.get("type") == "text" and item.get("text"):
+            parts.append(item["text"])
+
+    return "\n".join(parts).strip()
+
+def import_conversations(path: str, memory: HybridMemorySystem, user_id: str) -> Dict[str, int]:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    if not isinstance(data, list):
+        raise ValueError("Expected a top-level JSON list of conversations.")
+
+    conv_count = 0
+    msg_total = 0
+    msg_imported = 0
+    msg_skipped = 0
+
+    for conv in data:
+        conv_count += 1
+        messages = conv.get("chat_messages") or []
+        if not messages:
+            continue
+
+        messages_sorted = sorted(messages, key=lambda m: m.get("created_at") or "")
+        for msg in messages_sorted:
+            msg_total += 1
+            sender = msg.get("sender")
+            if sender == "human":
+                role = "user"
+            elif sender == "assistant":
+                role = "assistant"
+            else:
+                msg_skipped += 1
+                continue
+
+            text = _extract_message_text(msg)
+            if not text:
+                msg_skipped += 1
+                continue
+
+            timestamp = msg.get("created_at")
+            memory.store_interaction(user_id, role, text, timestamp=timestamp)
+            msg_imported += 1
+
+    return {
+        "conversations": conv_count,
+        "messages_total": msg_total,
+        "messages_imported": msg_imported,
+        "messages_skipped": msg_skipped,
+    }
+
+def print_stats(memory: HybridMemorySystem, user_id: str):
+    conn = sqlite3.connect(memory.db_path)
+    c = conn.cursor()
+
+    c.execute("SELECT COUNT(*) FROM conversation_turns")
+    total_turns = c.fetchone()[0]
+    c.execute("SELECT COUNT(DISTINCT user_id) FROM conversation_turns")
+    distinct_users = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM conversation_turns WHERE user_id = ?", (user_id,))
+    user_turns = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM conversation_turns WHERE user_id = ? AND role = 'user'", (user_id,))
+    user_user_turns = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM conversation_turns WHERE user_id = ? AND role = 'assistant'", (user_id,))
+    user_assistant_turns = c.fetchone()[0]
+
+    c.execute("SELECT COUNT(*) FROM explicit_memories WHERE user_id = ?", (user_id,))
+    explicit_count = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM implicit_memories WHERE user_id = ?", (user_id,))
+    implicit_count = c.fetchone()[0]
+
+    c.execute("SELECT MIN(timestamp), MAX(timestamp) FROM conversation_turns WHERE user_id = ?", (user_id,))
+    first_ts, last_ts = c.fetchone()
+
+    conn.close()
+
+    print("\n📊 Stats")
+    print(f"  Total turns (all users): {total_turns}")
+    print(f"  Distinct users: {distinct_users}")
+    print(f"  Current user_id: {user_id}")
+    print(f"  Turns (user): {user_turns} (user: {user_user_turns}, assistant: {user_assistant_turns})")
+    print(f"  Explicit memories: {explicit_count}")
+    print(f"  Implicit memories: {implicit_count}")
+    if first_ts and last_ts:
+        print(f"  Time range: {first_ts} → {last_ts}")
+
+def print_explain(memory: HybridMemorySystem, user_id: str, query: str):
+    context = memory.explain_context(user_id, query)
+    explicit = context.get("explicit_facts", [])
+    implicit = context.get("behavioral_patterns", [])
+    debug = context.get("debug", {})
+
+    print("\n🧭 Explain")
+    print(f"  Query: {query}")
+    if debug.get("embedding_backend"):
+        print(f"  Embedding backend: {debug['embedding_backend']}")
+
+    print("\n  Explicit facts used:")
+    if explicit:
+        for mem in explicit:
+            src = mem.get("source", "unknown")
+            rel = mem.get("relevance", 0.0)
+            print(f"    - ({src}, rel={rel:.3f}) {mem.get('content')}")
+    else:
+        print("    - (none)")
+
+    print("\n  Implicit patterns used:")
+    if implicit:
+        for pat in implicit:
+            conf = pat.get("confidence", 0.0)
+            rel = pat.get("relevance", 0.0)
+            age = pat.get("age_days", 0)
+            category = pat.get("category", "unknown")
+            print(f"    - ({category}, conf={conf:.2f}, rel={rel:.3f}, age={age}d) {pat.get('pattern')}")
+    else:
+        print("    - (none)")
+
+    if debug:
+        print("\n  Thresholds:")
+        print(f"    - explicit_top_k: {debug.get('explicit_top_k')}")
+        print(f"    - recent_explicit_limit: {debug.get('recent_explicit_limit')}")
+        print(f"    - implicit_conf_threshold: {debug.get('implicit_conf_threshold')}")
+        print(f"    - implicit_relevance_threshold: {debug.get('implicit_relevance_threshold')}")
+        print(f"    - implicit_high_conf_bypass: {debug.get('implicit_high_conf_bypass')}")
+        print(f"    - explicit_candidates: {debug.get('explicit_candidates')}")
+        print(f"    - implicit_candidates: {debug.get('implicit_candidates')}")
+
 def interactive_chat():
     """Run an interactive chat session with memory"""
     print("🧠 Hybrid Memory System - Interactive Mode")
@@ -149,6 +286,9 @@ def interactive_chat():
                 print("  /quit            Save the current session and exit")
                 print("  /memories        Show explicit memories and implicit patterns for this user")
                 print("  /forget <text>   Forget explicit memories whose content contains <text>")
+                print("  /import <file>   Import chat sessions from a JSON export")
+                print("  /stats           Show database stats for the current user")
+                print("  /explain <text>  Explain which memories were used for a query")
                 print("  /save            Snapshot the current memory DB to data/chat_memory_YYYYMMDD_HHMMSS.db")
                 print("  /load <file>     Load a saved DB file into the active session")
                 print("  (Anything else)  Is treated as a normal message to the assistant")
@@ -193,6 +333,46 @@ def interactive_chat():
                 conn.commit()
                 conn.close()
                 print(f"Forgot {deleted} memory/ies matching '{to_forget}'")
+                continue
+
+            elif user_input.lower().startswith("/import"):
+                parts = shlex.split(user_input)
+                if len(parts) < 2:
+                    print("Usage: /import <file> [--user <user_id>]")
+                    continue
+
+                path = parts[1]
+                import_user_id = user_id
+                if "--user" in parts:
+                    idx = parts.index("--user")
+                    if idx + 1 < len(parts):
+                        import_user_id = parts[idx + 1]
+
+                if not os.path.exists(path):
+                    print(f"File not found: {path}")
+                    continue
+
+                try:
+                    stats = import_conversations(path, memory, import_user_id)
+                    print(
+                        f"Imported {stats['messages_imported']} / {stats['messages_total']} messages "
+                        f"from {stats['conversations']} conversations for user_id={import_user_id} "
+                        f"(skipped {stats['messages_skipped']})."
+                    )
+                except Exception as e:
+                    print(f"Error importing conversations: {e}")
+                continue
+
+            elif user_input.lower() == "/stats":
+                print_stats(memory, user_id)
+                continue
+
+            elif user_input.lower().startswith("/explain"):
+                query = user_input[len("/explain"):].strip()
+                if not query:
+                    print("Usage: /explain <text>")
+                    continue
+                print_explain(memory, user_id, query)
                 continue
 
             elif user_input.lower() == "/save":

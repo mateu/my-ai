@@ -132,6 +132,13 @@ class VectorStore:
         return results
 
 class HybridMemorySystem:
+    # Retrieval / filtering defaults
+    EXPLICIT_TOP_K = 3
+    RECENT_EXPLICIT_LIMIT = 5
+    IMPLICIT_CONF_THRESHOLD = 0.6
+    IMPLICIT_RELEVANCE_THRESHOLD = 0.3
+    IMPLICIT_HIGH_CONF_BYPASS = 0.8
+
     def __init__(self, db_path: str | None = None):
         if db_path is None:
             db_path = os.path.join("data", "memory.db")
@@ -460,9 +467,10 @@ Output: {"facts": ["name: Hunter"]}
             facts_str = ", ".join(facts[:-1]) + f" and {facts[-1]}"
             return f"Got it, I'll remember: {facts_str}"
 
-    def store_interaction(self, user_id: str, role: str, content: str):
+    def store_interaction(self, user_id: str, role: str, content: str, timestamp: Optional[str] = None):
         """Store conversation turn and trigger memory processing with single transaction."""
-        timestamp = datetime.now().isoformat()
+        if timestamp is None:
+            timestamp = datetime.now().isoformat()
 
         conn = sqlite3.connect(self.db_path)
         try:
@@ -602,12 +610,12 @@ Output: {"facts": ["name: Hunter"]}
         finally:
             conn.close()
 
-    def get_context(self, user_id: str, current_query: str) -> Dict:
-        """Retrieve relevant memories for injection into prompt"""
+    def _build_context(self, user_id: str, current_query: str, include_debug: bool = False) -> Dict:
+        """Build context and optional debug details for a query."""
         query_emb = self._get_embedding(current_query)
 
         # 1. Explicit memories (semantic search)
-        explicit_results = self.vector_store.search(query_emb, user_id, top_k=3)
+        explicit_results = self.vector_store.search(query_emb, user_id, top_k=self.EXPLICIT_TOP_K)
         explicit_memories = []
         for mem_id, score in explicit_results:
             if score > 0.0:  # Similarity threshold (lowered for mock embedding)
@@ -617,7 +625,8 @@ Output: {"facts": ["name: Hunter"]}
                     meta = self.vector_store.metadata[idx]
                     explicit_memories.append({
                         "content": meta["text"],
-                        "relevance": score
+                        "relevance": score,
+                        "source": "vector",
                     })
 
         # Fallback: if nothing surfaced via the vector store (e.g., in tests or
@@ -634,8 +643,8 @@ Output: {"facts": ["name: Hunter"]}
             """SELECT content FROM explicit_memories
                WHERE user_id = ?
                ORDER BY datetime(created_at) DESC
-               LIMIT 5""",
-            (user_id,),
+               LIMIT ?""",
+            (user_id, self.RECENT_EXPLICIT_LIMIT),
         )
         recent_rows = [content for (content,) in c.fetchall()]
 
@@ -645,6 +654,7 @@ Output: {"facts": ["name: Hunter"]}
                 explicit_memories.append({
                     "content": content,
                     "relevance": 1.0,
+                    "source": "recent",
                 })
         else:
             # We already have some vector-surfaced facts; make sure we also
@@ -656,6 +666,7 @@ Output: {"facts": ["name: Hunter"]}
                     explicit_memories.append({
                         "content": content,
                         "relevance": 1.0,
+                        "source": "recent",
                     })
 
         # Consolidate explicit facts by logical field to avoid redundant variants.
@@ -679,43 +690,72 @@ Output: {"facts": ["name: Hunter"]}
 
         explicit_memories = list(consolidated.values())
 
-
-
         # 2. Implicit memories (with decay and filtering)
-        c.execute('''SELECT pattern, confidence, last_observed, decay_factor
+        c.execute('''SELECT category, pattern, confidence, last_observed, decay_factor
                      FROM implicit_memories WHERE user_id = ?''', (user_id,))
 
         implicit_memories = []
         now = datetime.now()
 
         for row in c.fetchall():
-            pattern, conf, last_obs, decay = row
+            category, pattern, conf, last_obs, decay = row
             last_dt = datetime.fromisoformat(last_obs)
             days_old = (now - last_dt).days
 
             # Apply temporal decay
             current_conf = conf * (decay ** days_old)
 
-            if current_conf > 0.6:  # Threshold
+            if current_conf > self.IMPLICIT_CONF_THRESHOLD:  # Threshold
                 # Check relevance to current query (simplified)
                 pattern_emb = self._get_embedding(pattern)
-                relevance = float(np.dot(query_emb / np.linalg.norm(query_emb),
-                                       pattern_emb / np.linalg.norm(pattern_emb)))
+                qnorm = np.linalg.norm(query_emb)
+                pnorm = np.linalg.norm(pattern_emb)
+                if qnorm > 0 and pnorm > 0:
+                    relevance = float(np.dot(query_emb / qnorm, pattern_emb / pnorm))
+                else:
+                    relevance = 0.0
 
-                if relevance > 0.3 or current_conf > 0.8:  # High confidence bypasses relevance
+                if relevance > self.IMPLICIT_RELEVANCE_THRESHOLD or current_conf > self.IMPLICIT_HIGH_CONF_BYPASS:
                     implicit_memories.append({
                         "pattern": pattern,
                         "confidence": current_conf,
-                        "category": row[0]  # You'd store category separately
+                        "category": category,
+                        "relevance": relevance,
+                        "age_days": days_old,
                     })
 
         conn.close()
 
-        return {
+        implicit_memories_sorted = sorted(implicit_memories, key=lambda x: x["confidence"], reverse=True)
+        implicit_top = implicit_memories_sorted[:2]
+
+        context = {
             "explicit_facts": explicit_memories,
-            "behavioral_patterns": sorted(implicit_memories, key=lambda x: x["confidence"], reverse=True)[:2],
+            "behavioral_patterns": implicit_top,
             "user_id": user_id
         }
+
+        if include_debug:
+            context["debug"] = {
+                "explicit_candidates": len(explicit_memories),
+                "implicit_candidates": len(implicit_memories_sorted),
+                "explicit_top_k": self.EXPLICIT_TOP_K,
+                "recent_explicit_limit": self.RECENT_EXPLICIT_LIMIT,
+                "implicit_conf_threshold": self.IMPLICIT_CONF_THRESHOLD,
+                "implicit_relevance_threshold": self.IMPLICIT_RELEVANCE_THRESHOLD,
+                "implicit_high_conf_bypass": self.IMPLICIT_HIGH_CONF_BYPASS,
+                "embedding_backend": os.getenv("AI_EMBEDDING_BACKEND", "mock"),
+            }
+
+        return context
+
+    def get_context(self, user_id: str, current_query: str) -> Dict:
+        """Retrieve relevant memories for injection into prompt"""
+        return self._build_context(user_id, current_query, include_debug=False)
+
+    def explain_context(self, user_id: str, current_query: str) -> Dict:
+        """Return context plus debug details for /explain."""
+        return self._build_context(user_id, current_query, include_debug=True)
 
     def format_for_prompt(self, context: Dict) -> str:
         """Format retrieved memories as text for LLM prompt"""
