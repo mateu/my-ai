@@ -21,3 +21,9 @@ chat_memory_kv_test.db
 
 # uv lockfile (can be regenerated from pyproject)
 uv.lock
+
+# Build artifacts
+*.egg-info/
+
+# Chroma database directory
+chroma_db/

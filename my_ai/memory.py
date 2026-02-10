@@ -150,7 +150,25 @@ class HybridMemorySystem:
                 os.makedirs(db_dir, exist_ok=True)
 
         self.db_path = db_path
-        self.vector_store = VectorStore()
+        
+        # VECTOR_DB env var controls the vector backend: 'memory' (default) or 'chroma'
+        vector_backend = os.getenv("VECTOR_DB", "memory").lower()
+
+        if vector_backend == "chroma":
+            # lazy import so chromadb is optional
+            try:
+                from my_ai.vector_backends.chroma_adapter import ChromaAdapter
+                persist_dir = os.getenv("CHROMA_PERSIST_DIR", "./chroma_db")
+                self.vector_store = ChromaAdapter(persist_directory=persist_dir, embedding_dim=384)
+            except Exception as e:
+                # fallback to in-memory if chroma isn't available
+                import warnings
+                warnings.warn(f"Failed to initialize Chroma backend, falling back to in-memory VectorStore: {e}")
+                self.vector_store = VectorStore()
+        else:
+            # default in-memory vector store (existing)
+            self.vector_store = VectorStore()
+        
         self.embeddings_cache = {}  # Simple embedding cache
 
         # Mock embedding function (replace with real model)

@@ -10,6 +10,7 @@ dependencies = [
   "python-dotenv",
   "requests",
   "pytest",
+  "chromadb>=0.4.0",
 ]
 
 [tool.uv]
